@@ -14,6 +14,7 @@ export interface TravelPlanRequest {
     preferences: {
       travelStyle: string;
       crowdTolerance: string;
+      seasonType: string;
       preferredSeason: string;
       safetyOptions: {
         avoidLateNight: boolean;
@@ -99,10 +100,13 @@ export async function generateTravelPlanWithOpenAI(
   // Build prompt from user preferences
   const preferencesSummary = request.travelers.map((t, idx) => {
     const prefs = t.preferences;
+    const seasonLabel = prefs.seasonType === 'peak' ? `Peak season — dates overlap with: ${prefs.preferredSeason || 'holidays'}` :
+      prefs.seasonType === 'off-peak' ? `Off-peak — dates fall in a quiet period` :
+      prefs.seasonType === 'mixed' ? `Mixed — dates span peak (${prefs.preferredSeason || 'holidays'}) and off-peak periods` : 'No preference';
     return `Traveler ${idx + 1} (${t.name}):
 - Travel Style: ${prefs.travelStyle}
 - Crowd Tolerance: ${prefs.crowdTolerance}
-- Preferred Holiday/Event Period: ${prefs.preferredSeason || 'Any'}
+- Travel Period (auto-detected from ${request.startDate} to ${request.endDate}): ${seasonLabel}
 - Budget Range: RM ${prefs.budgetMin || '0'} - RM ${prefs.budgetMax || 'Unlimited'}
 - Safety Preferences: ${prefs.safetyOptions.avoidLateNight ? 'Avoid late night activities, ' : ''}${prefs.safetyOptions.preferWellLit ? 'Prefer well-lit areas, ' : ''}${prefs.safetyOptions.verifiedTransport ? 'Use verified transport' : ''}`;
   }).join('\n\n');
@@ -197,7 +201,8 @@ Return ONLY valid JSON, no additional text or markdown formatting.`;
         'Authorization': `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini', // Using cost-effective model, can upgrade to gpt-4 if needed
+        model: 'gpt-5.2',
+        temperature: 0,
         messages: [
           {
             role: 'system',
@@ -208,9 +213,8 @@ Return ONLY valid JSON, no additional text or markdown formatting.`;
             content: prompt
           }
         ],
-        temperature: 0.7,
-        max_tokens: 4000,
-        response_format: { type: 'json_object' } // Force JSON response
+        max_completion_tokens: 8000,
+        response_format: { type: 'json_object' }
       })
     });
 

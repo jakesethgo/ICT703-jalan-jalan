@@ -9,115 +9,66 @@ interface RequestData {
   travelers: number
 }
 
-async function generateQuickPlanWithOpenAI(data: RequestData) {
-  if (!OPENAI_API_KEY) {
-    throw new Error('OpenAI API key not configured')
-  }
-
+// Build compressed prompt for quick predictions
+function buildQuickPrompt(data: RequestData) {
   const start = new Date(data.start_date)
   const end = new Date(data.end_date)
   const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1
 
-  const prompt = `Generate travel predictions for ${data.destination}, Malaysia. ${days} days trip.
+  const prompt = `Travel predictions for ${data.destination}, Malaysia. ${days} days.
 
-Return JSON with ACTUAL values (not templates):
-{
-  "summary": {
-    "destination": "${data.destination}",
-    "duration": "${days} days",
-    "estimatedBudget": "RM 800 - RM 1,500",
-    "highlights": ["3 real highlights for ${data.destination}"]
-  },
-  "predictions": {
-    "weather": {
-      "temperature": "28-32°C",
-      "condition": "Partly Cloudy",
-      "icon": "cloud-sun",
-      "rainChance": 30,
-      "humidity": 75,
-      "summary": "Brief weather summary"
-    },
-    "crowdLevel": {
-      "overall": "Medium",
-      "percentage": 60,
-      "peakHours": "11am - 2pm",
-      "summary": "Brief crowd summary",
-      "data": [{"time":"6am","level":15},{"time":"8am","level":35},{"time":"10am","level":55},{"time":"12pm","level":75},{"time":"2pm","level":70},{"time":"4pm","level":60},{"time":"6pm","level":45},{"time":"9pm","level":25}]
-    },
-    "pricing": {
-      "trend": "stable",
-      "percentChange": -5,
-      "summary": "Brief price summary"
-    },
-    "traffic": {
-      "peakDelay": "15-25 min",
-      "summary": "Brief traffic summary",
-      "data": [{"time":"6am","level":20},{"time":"8am","level":75},{"time":"10am","level":45},{"time":"12pm","level":50},{"time":"2pm","level":40},{"time":"4pm","level":55},{"time":"6pm","level":80},{"time":"9pm","level":30}]
-    },
-    "hotelOccupancy": {
-      "percentage": 65,
-      "summary": "Brief availability summary"
-    }
-  },
-  "topAttractions": [
-    {"name": "Attraction 1", "type": "Culture", "tip": "Visit tip"},
-    {"name": "Attraction 2", "type": "Nature", "tip": "Visit tip"},
-    {"name": "Attraction 3", "type": "Food", "tip": "Visit tip"},
-    {"name": "Attraction 4", "type": "Culture", "tip": "Visit tip"},
-    {"name": "Attraction 5", "type": "Adventure", "tip": "Visit tip"}
-  ],
-  "alerts": [
-    {"type": "crowd", "title": "Alert title", "description": "Alert description", "level": "warning", "location": "Place name"},
-    {"type": "weather", "title": "Alert title", "description": "Alert description", "level": "info", "location": "Place name"},
-    {"type": "price", "title": "Alert title", "description": "Alert description", "level": "success", "location": "Place name"}
-  ],
-  "quickTips": [
-    {"title": "Tip 1", "description": "Tip description"},
-    {"title": "Tip 2", "description": "Tip description"},
-    {"title": "Tip 3", "description": "Tip description"},
-    {"title": "Tip 4", "description": "Tip description"}
-  ]
+Output a single JSON object with fields in EXACT order below. Complete each section fully before moving to the next.
+
+Return JSON:{"summary":{"destination":"${data.destination}","duration":"${days} days","estimatedBudget":"RM 800 - RM 1,500","highlights":["3 real highlights"]},"topAttractions":[{"name":"Real name","type":"Culture|Nature|Food|Adventure","tip":"visit tip"},{"name":"...","type":"...","tip":"..."},{"name":"...","type":"...","tip":"..."},{"name":"...","type":"...","tip":"..."},{"name":"...","type":"...","tip":"..."}],"predictions":{"weather":{"temperature":"28-32°C","condition":"Partly Cloudy","icon":"cloud-sun","rainChance":30,"humidity":75,"summary":"brief"},"crowdLevel":{"overall":"Medium","percentage":60,"peakHours":"11am - 2pm","summary":"brief","data":[{"time":"6am","level":15},{"time":"8am","level":35},{"time":"10am","level":55},{"time":"12pm","level":75},{"time":"2pm","level":70},{"time":"4pm","level":60},{"time":"6pm","level":45},{"time":"9pm","level":25}]},"pricing":{"trend":"stable","percentChange":-5,"summary":"brief"},"traffic":{"peakDelay":"15-25 min","summary":"brief","data":[{"time":"6am","level":20},{"time":"8am","level":75},{"time":"10am","level":45},{"time":"12pm","level":50},{"time":"2pm","level":40},{"time":"4pm","level":55},{"time":"6pm","level":80},{"time":"9pm","level":30}]},"hotelOccupancy":{"percentage":65,"summary":"brief"}},"quickTips":[{"title":"tip","description":"desc"},{"title":"...","description":"..."},{"title":"...","description":"..."},{"title":"...","description":"..."}]}
+
+Use REAL ${data.destination} data. Pick ONE weather condition. Valid JSON only.`
+
+  return { prompt, days }
 }
 
-IMPORTANT: Replace ALL placeholder values with REAL data for ${data.destination}. Do NOT use pipe characters or template text. Use real attraction names, real tips, real weather conditions (pick ONE: Sunny, Partly Cloudy, Cloudy, or Rainy). Valid JSON only.`
+// Stream OpenAI SSE response content tokens to client
+function createOpenAIStream(openaiResponse: Response): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder()
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content: 'Malaysian travel advisor. Return concise JSON with general destination predictions. Focus on practical travel information.'
-        },
-        {
-          role: 'user',
-          content: prompt
+  return new ReadableStream({
+    async start(controller) {
+      const reader = openaiResponse.body!.getReader()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || !trimmed.startsWith('data: ')) continue
+            if (trimmed === 'data: [DONE]') continue
+
+            try {
+              const parsed = JSON.parse(trimmed.slice(6))
+              const content = parsed.choices?.[0]?.delta?.content
+              if (content) {
+                controller.enqueue(encoder.encode(content))
+              }
+            } catch {
+              // skip malformed SSE chunks
+            }
+          }
         }
-      ],
-      max_tokens: 3000,
-      temperature: 0.7,
-      response_format: { type: 'json_object' }
-    })
+      } catch (e) {
+        controller.error(e)
+        return
+      }
+
+      controller.close()
+    },
   })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(`OpenAI API error: ${response.status} - ${errorData.error?.message || 'Unknown error'}`)
-  }
-
-  const apiData = await response.json()
-  const content = apiData.choices[0]?.message?.content
-
-  if (!content) {
-    throw new Error('No content received from OpenAI')
-  }
-
-  return JSON.parse(content)
 }
 
 // Default fallback data
@@ -229,25 +180,53 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const start = new Date(data.start_date)
-    const end = new Date(data.end_date)
-    const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1
+    const { prompt, days } = buildQuickPrompt(data)
 
-    // Generate quick prediction with OpenAI (no file storage)
-    let quickPrediction
-    try {
-      quickPrediction = await generateQuickPlanWithOpenAI(data)
-    } catch (openAIError) {
-      console.error('OpenAI error, using fallback:', openAIError)
-      quickPrediction = getDefaultQuickData(data.destination, days, data.travelers || 1)
+    if (!OPENAI_API_KEY) {
+      const fallback = getDefaultQuickData(data.destination, days, data.travelers || 1)
+      return new Response(JSON.stringify(fallback), {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      })
     }
 
-    // Return directly without storing to file
-    return NextResponse.json({
-      success: true,
-      data: quickPrediction
-    })
+    try {
+      const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.2',
+          stream: true,
+          temperature: 0,
+          messages: [
+            { role: 'system', content: 'Malaysian travel advisor. Return concise JSON with real destination data.' },
+            { role: 'user', content: prompt },
+          ],
+          max_completion_tokens: 4000,
+          response_format: { type: 'json_object' },
+        }),
+      })
 
+      if (!openaiResponse.ok) {
+        const errorData = await openaiResponse.json().catch(() => ({}))
+        throw new Error(`OpenAI: ${openaiResponse.status} - ${errorData.error?.message || 'Unknown error'}`)
+      }
+
+      return new Response(createOpenAIStream(openaiResponse), {
+        headers: {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        },
+      })
+    } catch {
+      console.error('OpenAI error, using fallback')
+      const fallback = getDefaultQuickData(data.destination, days, data.travelers || 1)
+      return new Response(JSON.stringify(fallback), {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      })
+    }
   } catch (error) {
     return NextResponse.json(
       {
@@ -262,13 +241,12 @@ export async function POST(request: NextRequest) {
 export async function GET() {
   return NextResponse.json({
     status: 'ok',
-    message: 'Quick Generate API - General destination predictions',
+    message: 'Quick Generate API - Streaming & Optimized',
     features: [
       'General destination overview',
       'Weather & crowd predictions',
-      'Top attractions',
-      'Quick tips',
-      'No data storage'
+      'Streaming response with gpt-5.2',
+      'Quick tips'
     ]
   })
 }

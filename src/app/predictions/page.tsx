@@ -3,14 +3,15 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
-  Globe2, Users, Calendar, Plane,
+  Users, Calendar, Plane,
   CloudRain, CloudSun, Sun, Thermometer, Cloud,
   Tag, Shield, ChevronLeft, Share2,
   Clock, Plus, Minus, Car, Building2, AlertTriangle,
   ArrowRight, Sparkles, CheckCircle2, Zap,
   MapPin as MapPinIcon, DollarSign, Bell, Brain, Lightbulb, X, Wand2,
-  TrendingUp, TrendingDown, BarChart3, Activity, Leaf, Info, ExternalLink, Settings2,
-  Mail, MessageCircle, Facebook, Instagram, AtSign, UserPlus, UserMinus
+  TrendingUp, TrendingDown, BarChart3, Activity, Leaf, Info, ExternalLink, Settings2, CalendarCheck, CalendarX, Recycle, Footprints, TreePine, Utensils, BedDouble, CircleDot,
+  Mail, MessageCircle, Facebook, Instagram, AtSign, UserPlus, UserMinus,
+  Copy, Link, RefreshCw, Loader2, ArrowUp
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -29,9 +30,181 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
 import { type DateRange } from "react-day-picker"
 import { PageLayout } from '@/components/shared/page-layout'
+import { detectPeakPeriods } from '@/lib/malaysian-peak-periods'
 import { GroupLabel } from '@/components/shared/group-label'
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
 import { Bar, BarChart, Line, LineChart, XAxis, YAxis } from 'recharts'
+
+// Read streamed JSON response from API with real-time progress tracking
+// Attempt to parse incomplete JSON by closing open structures
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function tryParsePartialJSON(text: string): any {
+  let str = text.trim()
+  if (!str) return null
+  try { return JSON.parse(str) } catch { /* continue to repair */ }
+
+  let inStr = false
+  let esc = false
+  const stack: string[] = []
+  for (const ch of str) {
+    if (esc) { esc = false; continue }
+    if (ch === '\\' && inStr) { esc = true; continue }
+    if (ch === '"') { inStr = !inStr; continue }
+    if (inStr) continue
+    if (ch === '{') stack.push('}')
+    else if (ch === '[') stack.push(']')
+    else if (ch === '}' || ch === ']') stack.pop()
+  }
+  if (inStr) str += '"'
+  str = str.replace(/,\s*$/, '')
+  while (stack.length) str += stack.pop()
+  try { return JSON.parse(str) } catch { return null }
+}
+
+// Detect which sections are FULLY ready in the streamed data (section-based structure).
+// Each check is strict — all sub-fields must be present before revealing.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function detectStreamSections(data: any): Set<string> {
+  const sections = new Set<string>()
+  if (!data?.plans) return sections
+  const planKeys = Object.keys(data.plans)
+
+  // Plans + Details: all 3 plans must have basic info with benefits (last field in basic schema)
+  if (planKeys.length >= 3 && planKeys.every(k => {
+    const p = data.plans[k]
+    return p?.pricePerPerson && p?.keyFeatures?.length > 0 && p?.benefits?.length > 0
+  })) {
+    sections.add('f-plans')
+    sections.add('f-details')
+  }
+
+  // Use first plan key as sentinel for each section
+  const first = planKeys[0]
+  if (!first) return sections
+
+  // Best Window: needs all 3 core fields
+  const bw = data.bestWindow?.[first]
+  if (bw?.optimalPeriod && bw?.priceAdvantage && bw?.crowdLevel) {
+    sections.add('f-window')
+  }
+
+  // Analytics: needs weather + priceIndex + crowdLevel.data + traffic.data
+  const an = data.analytics?.[first]
+  if (an?.weather?.temperature && an?.priceIndex?.trend &&
+      an?.crowdLevel?.data?.length >= 8 && an?.traffic?.data?.length >= 8) {
+    sections.add('f-analytics')
+  }
+
+  // Sustainability: needs overallScore + overallLabel + summary paragraph + recommendations array
+  const su = data.sustainability?.[first]
+  if (su?.overallScore !== undefined && su?.overallLabel &&
+      typeof su?.summary === 'string' && su.summary.length > 20 &&
+      su?.recommendations?.length >= 4) {
+    sections.add('f-sustainability')
+  }
+
+  // Alerts: all 4 types must be present with at least 1 item each
+  const al = data.alerts?.[first]
+  if (al?.crowd?.length > 0 && al?.weather?.length > 0 &&
+      al?.price?.length > 0 && al?.safety?.length > 0) {
+    sections.add('f-alerts')
+  }
+
+  // Suggestions: need at least 3 items with title + description
+  const sg = data.suggestions?.[first]
+  if (sg?.length >= 3 && sg.every((s: any) => s?.title && s?.description)) {
+    sections.add('f-suggestions')
+  }
+
+  return sections
+}
+
+// Detect which quick-generate sections are FULLY ready to render
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function detectQuickSections(data: any): Set<string> {
+  const sections = new Set<string>()
+  // Overview: needs summary + topAttractions with items
+  if (data?.summary?.destination && data?.topAttractions?.length >= 3) {
+    sections.add('q-overview')
+  }
+  // Analytics: needs weather + crowdLevel + pricing + traffic
+  if (data?.predictions?.weather?.temperature && data?.predictions?.crowdLevel?.data?.length >= 8 &&
+      data?.predictions?.pricing?.trend && data?.predictions?.traffic?.data?.length >= 8) {
+    sections.add('q-analytics')
+  }
+  // Tips: need at least 3 items with title + description
+  if (data?.quickTips?.length >= 3 && data.quickTips.every((t: any) => t?.title && t?.description)) {
+    sections.add('q-tips')
+  }
+  return sections
+}
+
+// Fix potentially nested plans structure from OpenAI
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function fixNestedPlans(data: any) {
+  if (data.plans) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const flatPlans: Record<string, any> = {}
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const extractPlans = (obj: any, depth = 0) => {
+      if (depth > 5) return
+      for (const [key, value] of Object.entries(obj)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if (value && typeof value === 'object' && 'pricePerPerson' in (value as any)) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const planCopy = { ...(value as Record<string, any>) }
+          for (const [innerKey, innerValue] of Object.entries(planCopy)) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            if (innerValue && typeof innerValue === 'object' && 'pricePerPerson' in (innerValue as any)) {
+              delete planCopy[innerKey]
+              extractPlans({ [innerKey]: innerValue }, depth + 1)
+            }
+          }
+          flatPlans[key] = planCopy
+        }
+      }
+    }
+    extractPlans(data.plans)
+    if (Object.keys(flatPlans).length > 0) {
+      data.plans = flatPlans
+    }
+  }
+  return data
+}
+
+async function readStreamedJSON(
+  response: Response,
+  onProgress?: (progress: number) => void,
+  expectedSize: number = 10000,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onPartialData?: (data: any) => void
+) {
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let lastParseLen = 0
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    text += decoder.decode(value, { stream: true })
+    if (onProgress) {
+      const rawProgress = Math.min(text.length / expectedSize, 1)
+      const mapped = 10 + rawProgress * 75
+      onProgress(mapped)
+    }
+    // Try partial JSON parsing every ~500 chars of new data
+    if (onPartialData && text.length - lastParseLen > 300) {
+      lastParseLen = text.length
+      const partial = tryParsePartialJSON(text)
+      if (partial) onPartialData(partial)
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const data = JSON.parse(text) as any
+  return fixNestedPlans(data)
+}
 
 // Simplified 3-step flow
 type Step = 'details' | 'preferences' | 'results'
@@ -47,6 +220,7 @@ interface TripData {
 interface Preferences {
   travelStyle: string
   crowdTolerance: string
+  seasonType: string
   preferredSeasons: string[]
   safetyOptions: {
     avoidLateNight: boolean
@@ -63,6 +237,323 @@ interface Preferences {
   }
 }
 
+// --- Skeleton section header ---
+function SkeletonHeader({ title, icon: Icon, delay = '0s' }: { title: string; icon: React.ElementType; delay?: string }) {
+  return (
+    <div className="flex items-center gap-2 mb-3 animate-fade-in-up" style={{ animationDelay: delay, animationFillMode: 'backwards' }}>
+      <Icon className="h-4 w-4 text-rose-400" />
+      <h3 className="text-sm font-semibold text-muted-foreground">{title}</h3>
+      <span className="text-xs text-rose-500 animate-pulse ml-1">Generating...</span>
+    </div>
+  )
+}
+
+const shimmer = 'bg-rose-100/70 dark:bg-rose-900/20 animate-pulse rounded-md'
+const shimmerLg = 'bg-rose-50 dark:bg-rose-950/20 animate-pulse rounded-lg'
+
+// --- Quick Generate Skeletons ---
+
+function QuickOverviewSkeleton() {
+  return (
+    <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.1s', animationFillMode: 'backwards' }}>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
+          <Sparkles className="h-4 w-4 text-rose-400" />
+        </div>
+        <h3 className="text-sm font-semibold text-muted-foreground">Quick Overview</h3>
+        <span className="text-xs text-rose-500 animate-pulse ml-1">Generating...</span>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-4">
+        {/* Left — budget + badges */}
+        <div className="space-y-3">
+          <div>
+            <div className={`h-3 w-24 ${shimmer} mb-2`} />
+            <div className={`h-8 w-40 ${shimmer} mb-1`} />
+            <div className={`h-3 w-16 ${shimmer}`} />
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            <div className={`h-6 w-20 ${shimmerLg}`} />
+            <div className={`h-6 w-24 ${shimmerLg}`} />
+            <div className={`h-6 w-16 ${shimmerLg}`} />
+          </div>
+        </div>
+        {/* Right — 2×2 stat grid */}
+        <div className="grid grid-cols-2 gap-2">
+          {[0,1,2,3].map(i => (
+            <div key={i} className="flex items-center gap-2.5 p-3 rounded-lg border border-rose-100 dark:border-rose-900/30 bg-white/60 dark:bg-white/5">
+              <div className={`h-4 w-4 rounded ${shimmer}`} />
+              <div className="space-y-1.5 flex-1">
+                <div className={`h-3 w-12 ${shimmer}`} />
+                <div className={`h-4 w-16 ${shimmer}`} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PredictiveAnalyticsSkeleton({ delay = '0.2s' }: { delay?: string }) {
+  return (
+    <div className="animate-fade-in-up" style={{ animationDelay: delay, animationFillMode: 'backwards' }}>
+      <SkeletonHeader title="Predictive Analytics" icon={BarChart3} delay={delay} />
+      {/* Weather & Price row */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        {[0,1].map(i => (
+          <div key={i} className="rounded-xl border bg-card p-4">
+            <div className="flex items-start justify-between">
+              <div className="space-y-2 flex-1">
+                <div className={`h-3 w-24 ${shimmer}`} />
+                <div className={`h-7 w-28 ${shimmer}`} />
+                <div className={`h-3.5 w-20 ${shimmer}`} />
+              </div>
+              <div className={`w-12 h-12 rounded-full ${shimmerLg}`} />
+            </div>
+            <div className="flex items-center gap-4 mt-4 pt-3 border-t">
+              <div className={`h-7 w-20 ${shimmerLg}`} />
+              <div className={`h-7 w-24 ${shimmerLg}`} />
+            </div>
+          </div>
+        ))}
+      </div>
+      {/* 3-col analytics grid */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {[0,1,2].map(i => (
+          <div key={i} className="rounded-xl border bg-card p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <div className={`w-8 h-8 ${shimmerLg}`} />
+              <div className={`h-4 w-24 ${shimmer}`} />
+            </div>
+            <div className={`h-6 w-16 ${shimmer} mb-3`} />
+            <div className={`h-[72px] w-full ${shimmerLg} mb-3`} />
+            <div className={`h-3 w-full ${shimmer}`} />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function QuickTipsSkeleton() {
+  return (
+    <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.4s', animationFillMode: 'backwards' }}>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
+          <Lightbulb className="h-4 w-4 text-rose-400" />
+        </div>
+        <h3 className="text-sm font-semibold text-muted-foreground">Quick Tips</h3>
+        <span className="text-xs text-rose-500 animate-pulse ml-1">Generating...</span>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-3">
+        {[0,1,2,3].map(i => (
+          <div key={i} className="flex items-start gap-3 p-4 rounded-lg bg-background/60 border">
+            <div className="w-8 h-8 rounded-full bg-rose-200 dark:bg-rose-800/40 animate-pulse shrink-0" />
+            <div className="flex-1 space-y-2">
+              <div className={`h-4 w-28 ${shimmer}`} />
+              <div className={`h-3 w-full ${shimmer}`} />
+              <div className={`h-3 w-3/4 ${shimmer}`} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// --- Full Plan Skeletons ---
+
+function PlanSelectionSkeleton() {
+  return (
+    <div className="animate-fade-in-up" style={{ animationDelay: '0.1s', animationFillMode: 'backwards' }}>
+      <SkeletonHeader title="Choose Your Plan" icon={Sparkles} delay="0.1s" />
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {[0,1,2].map(i => (
+          <div key={i} className="rounded-xl border bg-card p-5 space-y-3">
+            {i === 1 && <div className="flex justify-center -mt-2 mb-1"><div className={`h-5 w-24 ${shimmerLg}`} /></div>}
+            <div className="flex items-start justify-between gap-2">
+              <div className={`h-5 w-32 ${shimmer}`} />
+              <div className={`w-5 h-5 rounded-full ${shimmerLg}`} />
+            </div>
+            <div className="space-y-1.5 min-h-[40px]">
+              <div className={`h-3.5 w-full ${shimmer}`} />
+              <div className={`h-3.5 w-3/4 ${shimmer}`} />
+            </div>
+            <div className={`h-8 w-28 ${shimmer}`} />
+            <div className="flex items-center gap-2">
+              <div className={`h-7 w-24 ${shimmerLg}`} />
+              <div className={`h-7 w-20 ${shimmerLg}`} />
+            </div>
+            <div className="pt-3 border-t space-y-2">
+              <div className={`h-3 w-24 ${shimmer}`} />
+              <div className="flex gap-1.5">
+                {[0,1].map(j => (
+                  <div key={j} className={`h-7 w-16 ${shimmerLg}`} />
+                ))}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function PlanDetailsSkeleton() {
+  return (
+    <div className="animate-fade-in-up" style={{ animationDelay: '0.2s', animationFillMode: 'backwards' }}>
+      <SkeletonHeader title="Plan Details" icon={Info} delay="0.2s" />
+      <div className="grid sm:grid-cols-2 gap-3">
+        {[0,1].map(col => (
+          <div key={col} className="rounded-xl border bg-card p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <div className={`w-8 h-8 ${shimmerLg}`} />
+              <div className={`h-4 w-24 ${shimmer}`} />
+            </div>
+            <div className="space-y-2.5">
+              {[0,1,2].map(i => (
+                <div key={i} className="flex items-start gap-2.5 p-2 rounded-lg bg-muted/30">
+                  <div className={`h-4 w-4 rounded-full ${shimmer} mt-0.5 shrink-0`} />
+                  <div className="flex-1 space-y-1">
+                    <div className={`h-3.5 w-full ${shimmer}`} />
+                    <div className={`h-3.5 w-2/3 ${shimmer}`} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function BestWindowSkeleton() {
+  return (
+    <div className="animate-fade-in-up" style={{ animationDelay: '0.3s', animationFillMode: 'backwards' }}>
+      <SkeletonHeader title="Best Travel Window" icon={Clock} delay="0.3s" />
+      <div className="grid grid-cols-3 gap-3">
+        {[0,1,2].map(i => (
+          <div key={i} className="rounded-xl border bg-card p-4 text-center">
+            <div className={`w-10 h-10 rounded-full ${shimmerLg} mx-auto mb-3`} />
+            <div className={`h-3 w-20 ${shimmer} mx-auto mb-2`} />
+            <div className={`h-4 w-24 ${shimmer} mx-auto`} />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SustainabilitySkeleton() {
+  return (
+    <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.5s', animationFillMode: 'backwards' }}>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
+          <Leaf className="h-4 w-4 text-rose-400" />
+        </div>
+        <h3 className="text-sm font-semibold text-muted-foreground">Sustainability Dashboard</h3>
+        <span className="text-xs text-rose-500 animate-pulse ml-1">Generating...</span>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-4">
+        {/* Resource Impact */}
+        <div>
+          <div className={`h-3 w-28 ${shimmer} mb-2`} />
+          <div className="space-y-2">
+            {[0,1,2].map(i => (
+              <div key={i} className="p-3 bg-background/60 rounded-lg border">
+                <div className="flex justify-between mb-2">
+                  <div className={`h-3.5 w-28 ${shimmer}`} />
+                  <div className={`h-3.5 w-14 ${shimmer}`} />
+                </div>
+                <div className={`h-2 w-full ${shimmerLg}`} />
+              </div>
+            ))}
+          </div>
+        </div>
+        {/* Community Impact */}
+        <div>
+          <div className={`h-3 w-32 ${shimmer} mb-2`} />
+          <div className="space-y-2">
+            {[0,1,2].map(i => (
+              <div key={i} className="p-3 bg-background/60 rounded-lg border">
+                <div className="flex justify-between mb-2">
+                  <div className={`h-3.5 w-32 ${shimmer}`} />
+                  <div className={`h-3.5 w-14 ${shimmer}`} />
+                </div>
+                <div className={`h-2 w-full ${shimmerLg}`} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      {/* Summary */}
+      <div className="mt-4 p-4 bg-background/60 rounded-lg border space-y-3">
+        <div className="flex items-center gap-3">
+          <div className={`w-16 h-16 rounded-full ${shimmerLg}`} />
+          <div className="flex-1 space-y-2">
+            <div className={`h-5 w-20 ${shimmerLg}`} />
+            <div className={`h-3 w-full ${shimmer}`} />
+            <div className={`h-3 w-5/6 ${shimmer}`} />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AlertsSkeleton() {
+  return (
+    <div className="animate-fade-in-up" style={{ animationDelay: '0.6s', animationFillMode: 'backwards' }}>
+      <SkeletonHeader title="Predictions & Alerts" icon={Bell} delay="0.6s" />
+      <div className="grid sm:grid-cols-2 gap-3">
+        {[0,1,2,3].map(i => (
+          <div key={i} className="rounded-xl border bg-card p-4">
+            <div className="flex items-start gap-3">
+              <div className={`w-10 h-10 ${shimmerLg} shrink-0`} />
+              <div className="flex-1 space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className={`h-4 w-28 ${shimmer}`} />
+                  <div className={`h-5 w-16 ${shimmerLg}`} />
+                </div>
+                <div className={`h-3 w-36 ${shimmer}`} />
+                <div className={`h-3 w-full ${shimmer}`} />
+                <div className={`h-10 w-full ${shimmerLg}`} />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function SuggestionsSkeleton({ delay = '0.7s' }: { delay?: string }) {
+  return (
+    <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: delay, animationFillMode: 'backwards' }}>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
+          <Lightbulb className="h-4 w-4 text-rose-400" />
+        </div>
+        <h3 className="text-sm font-semibold text-muted-foreground">Personalized Suggestions</h3>
+        <span className="text-xs text-rose-500 animate-pulse ml-1">Generating...</span>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-3">
+        {[0,1,2,3].map(i => (
+          <div key={i} className="flex items-start gap-3 p-4 rounded-lg bg-background/60 border">
+            <div className="w-8 h-8 rounded-full bg-rose-200 dark:bg-rose-800/40 animate-pulse shrink-0" />
+            <div className="flex-1 space-y-2">
+              <div className={`h-4 w-28 ${shimmer}`} />
+              <div className={`h-3 w-full ${shimmer}`} />
+              <div className={`h-3 w-3/4 ${shimmer}`} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function TravelSmartPage() {
   const router = useRouter()
   const [currentStep, setCurrentStep] = useState<Step>('details')
@@ -77,6 +568,7 @@ export default function TravelSmartPage() {
   const [preferences, setPreferences] = useState<Preferences[]>([{
     travelStyle: 'balanced',
     crowdTolerance: 'avoid-crowd',
+    seasonType: 'no-preference',
     preferredSeasons: [],
     safetyOptions: {
       avoidLateNight: true,
@@ -94,9 +586,12 @@ export default function TravelSmartPage() {
   }])
   const [currentTravelerIndex, setCurrentTravelerIndex] = useState<number>(0)
   const [selectedPlan, setSelectedPlan] = useState<string>('Balanced Plan')
-  const [isGenerating, setIsGenerating] = useState<boolean>(false)
+  const [streamingMode, setStreamingMode] = useState<'quick' | 'full' | null>(null)
+  const [showCompletionBanner, setShowCompletionBanner] = useState(false)
+  const [revealedSections, setRevealedSections] = useState<Set<string>>(new Set())
+  const [contentVisible, setContentVisible] = useState<Set<string>>(new Set())
+  const exitTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [showAllPreferences, setShowAllPreferences] = useState<boolean>(false)
-  const [generationProgress, setGenerationProgress] = useState<number>(0)
   const [destinationSearch, setDestinationSearch] = useState<string>('')
   const [showDestinationDropdown, setShowDestinationDropdown] = useState<boolean>(false)
   const [generatedPlan, setGeneratedPlan] = useState<any>(null)
@@ -107,6 +602,69 @@ export default function TravelSmartPage() {
   const [isSaving, setIsSaving] = useState<boolean>(false)
   const [touchedFields, setTouchedFields] = useState<Set<string>>(new Set())
   const [submitAttempted, setSubmitAttempted] = useState<boolean>(false)
+  const [peakOverride, setPeakOverride] = useState<boolean>(false)
+
+  // Shared trip (invite friends) state
+  const [sharedTripId, setSharedTripId] = useState<string | null>(null)
+  const [creatorParticipantId, setCreatorParticipantId] = useState<string | null>(null)
+  const [sharedTripData, setSharedTripData] = useState<any>(null)
+  const [isCreatingTrip, setIsCreatingTrip] = useState(false)
+  const [linkCopied, setLinkCopied] = useState(false)
+  const [scrollProgress, setScrollProgress] = useState(0)
+
+  // Track scroll progress on results step
+  useEffect(() => {
+    if (currentStep !== 'results') { setScrollProgress(0); return }
+    const handleScroll = () => {
+      const scrollTop = window.scrollY
+      const docHeight = document.documentElement.scrollHeight - window.innerHeight
+      setScrollProgress(docHeight > 0 ? Math.min(scrollTop / docHeight, 1) : 0)
+    }
+    window.addEventListener('scroll', handleScroll, { passive: true })
+    handleScroll()
+    return () => window.removeEventListener('scroll', handleScroll)
+  }, [currentStep])
+
+  // Auto-dismiss completion banner after 4 seconds
+  useEffect(() => {
+    if (showCompletionBanner) {
+      const timer = setTimeout(() => setShowCompletionBanner(false), 4000)
+      return () => clearTimeout(timer)
+    }
+  }, [showCompletionBanner])
+
+  // Skeleton exit → content entrance transition
+  // When a section is revealed, wait 300ms (skeleton fades out) then show content
+  useEffect(() => {
+    // Reset on new generation
+    if (revealedSections.size === 0 && contentVisible.size > 0) {
+      exitTimersRef.current.forEach(t => clearTimeout(t))
+      exitTimersRef.current.clear()
+      setContentVisible(new Set())
+      return
+    }
+    revealedSections.forEach(section => {
+      if (!contentVisible.has(section) && !exitTimersRef.current.has(section)) {
+        const timer = setTimeout(() => {
+          setContentVisible(prev => new Set([...prev, section]))
+          exitTimersRef.current.delete(section)
+        }, 300)
+        exitTimersRef.current.set(section, timer)
+      }
+    })
+  }, [revealedSections]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Helper: is a section's skeleton currently fading out?
+  const isSectionExiting = useCallback(
+    (id: string) => revealedSections.has(id) && !contentVisible.has(id),
+    [revealedSections, contentVisible]
+  )
+
+  // Auto-detect peak/off-peak from selected dates
+  const peakDetection = useMemo(() => {
+    if (!tripData.dateRange?.from || !tripData.dateRange?.to) return null
+    return detectPeakPeriods(tripData.dateRange.from, tripData.dateRange.to)
+  }, [tripData.dateRange])
 
   // Track field blur for on-blur validation
   const markTouched = useCallback((travelerIndex: number, field: string) => {
@@ -128,7 +686,6 @@ export default function TravelSmartPage() {
       if (!tripData.travelerNames[i]?.trim()) errors.push({ travelerIndex: i, field: 'name' })
       if (!tripData.travelerGenders[i]) errors.push({ travelerIndex: i, field: 'gender' })
       if (!preferences[i]?.budgetMax) errors.push({ travelerIndex: i, field: 'budgetMax' })
-      if (!preferences[i]?.preferredSeasons?.length) errors.push({ travelerIndex: i, field: 'seasons' })
       const safety = preferences[i]?.safetyOptions
       if (safety && !safety.avoidLateNight && !safety.preferWellLit && !safety.verifiedTransport) {
         errors.push({ travelerIndex: i, field: 'safety' })
@@ -161,6 +718,7 @@ export default function TravelSmartPage() {
     const defaultPreferences: Preferences = {
       travelStyle: 'balanced',
       crowdTolerance: 'avoid-crowd',
+      seasonType: 'no-preference',
       preferredSeasons: [],
       safetyOptions: {
         avoidLateNight: true,
@@ -299,28 +857,69 @@ export default function TravelSmartPage() {
       energyConsumption: { value: 45, level: 'Medium' },
       localBusinessSupport: 'Medium',
       infrastructurePressure: 'Medium',
-      culturalPreservation: 'Positive'
+      culturalPreservation: 'Positive',
+      overallScore: 65,
+      overallLabel: 'Moderate',
+      summary: 'This plan has a moderate sustainability profile. Water usage and energy consumption are at average levels due to standard accommodations. Waste generation is kept low through local dining choices. Consider visiting during off-peak periods for a lower environmental footprint.',
+      carbonFootprint: {
+        level: 'Medium',
+        estimate: '45 kg CO2 per person',
+        comparison: '10% lower than average tourist'
+      },
+      travelDateAssessment: {
+        currentDates: {
+          suitability: 'Moderate',
+          reason: 'Average tourist activity during this period'
+        },
+        recommendedDates: {
+          period: 'Off-peak season months',
+          reason: 'Lower crowds and reduced environmental impact'
+        },
+        peakSeasons: ['School holidays', 'Public holiday weekends'],
+        level: 'Medium'
+      },
+      recommendations: [
+        { tip: 'Use public transport to reduce carbon footprint', impact: 'High', category: 'Transport' },
+        { tip: 'Support local businesses and street vendors', impact: 'High', category: 'Food' },
+        { tip: 'Carry reusable bottles to minimize waste', impact: 'Medium', category: 'Waste' },
+        { tip: 'Visit popular sites during off-peak hours', impact: 'Medium', category: 'Activity' },
+        { tip: 'Choose eco-friendly accommodations when possible', impact: 'High', category: 'Accommodation' },
+        { tip: 'Reduce single-use plastics during your trip', impact: 'Low', category: 'Waste' }
+      ]
     }
   }
 
   // Use OpenAI-generated data if available, otherwise minimal fallback
-  const aiAlerts = generatedPlan?.plans?.[selectedPlan]?.alerts
+  // Section data is now at top-level keys, keyed by plan name (section-based streaming structure)
+  const aiAlerts = generatedPlan?.alerts?.[selectedPlan]
   const alerts = aiAlerts || getMinimalFallbackAlerts()
 
-  const aiSuggestions = generatedPlan?.plans?.[selectedPlan]?.suggestions
+  const aiSuggestions = generatedPlan?.suggestions?.[selectedPlan]
   const suggestions = aiSuggestions || getMinimalFallbackSuggestions()
 
-  const aiAnalytics = generatedPlan?.plans?.[selectedPlan]?.analytics
+  const aiAnalytics = generatedPlan?.analytics?.[selectedPlan]
   const analytics = aiAnalytics || getMinimalFallbackAnalytics()
 
-  const aiSustainability = generatedPlan?.plans?.[selectedPlan]?.sustainability
+  const aiSustainability = generatedPlan?.sustainability?.[selectedPlan]
   const sustainability = aiSustainability || getMinimalFallbackSustainability()
 
-  const aiBestWindow = generatedPlan?.plans?.[selectedPlan]?.bestWindow
+  const aiBestWindow = generatedPlan?.bestWindow?.[selectedPlan]
 
 
   const handleDetailsSubmit = () => {
     if (tripData.destination && tripData.dateRange?.from && tripData.dateRange?.to) {
+      // Auto-set seasonType and preferredSeasons from date detection + override
+      if (peakDetection) {
+        const effectiveSeasonType = peakOverride ? 'off-peak' : peakDetection.seasonType
+        const effectiveSeasons = peakOverride ? [] : peakDetection.overlappingPeriods.map(op => op.name)
+        const newPrefs = preferences.map(p => ({
+          ...p,
+          seasonType: effectiveSeasonType,
+          preferredSeasons: effectiveSeasons,
+        }))
+        setPreferences(newPrefs)
+      }
+
       if (quickGenerate) {
         // Skip preferences, go directly to generation
         handleGeneratePlan(true)
@@ -330,32 +929,26 @@ export default function TravelSmartPage() {
     }
   }
 
+
   const handleGeneratePlan = async (isQuickGenerate: boolean = false) => {
-    // Cancel any previous request
+    // Cancel any previous request (silently — don't let its catch reset our new state)
     generateAbortRef.current?.abort()
     const abortController = new AbortController()
     generateAbortRef.current = abortController
 
-    // Reset and show dialog
-    setGenerationProgress(0)
-    setIsGenerating(true)
+    // Clear old data and revealed sections so all skeletons show
+    setGeneratedPlan(null)
+    setQuickGenerateData(null)
+    setRevealedSections(new Set())
 
-    // Animate progress: slowly to 35% (before icon 2 completes at 40%), then wait for API
-    let progressValue = 0
-    setGenerationProgress(0)
-
-    const progressInterval = setInterval(() => {
-      if (progressValue < 35) {
-        progressValue = Math.min(progressValue + 1, 35)
-        setGenerationProgress(progressValue)
-      }
-    }, 200)
+    // Navigate to results immediately with skeleton loading
+    setStreamingMode(isQuickGenerate ? 'quick' : 'full')
+    setShowCompletionBanner(false)
+    setCurrentStep('results')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
 
     try {
-      let result
-
       if (isQuickGenerate) {
-        // Quick Generate - call different API, no storage
         const quickRequestData = {
           destination: tripData.destination,
           start_date: tripData.dateRange?.from ? tripData.dateRange.from.toISOString().split('T')[0] : '',
@@ -375,19 +968,24 @@ export default function TravelSmartPage() {
           throw new Error(errorData.error || `HTTP ${response.status}: Failed to generate quick prediction`)
         }
 
-        result = await response.json()
-
-        if (!result.success) {
-          throw new Error(result.error || 'Failed to generate quick prediction')
-        }
-
-        // Store quick generate data
-        if (result.data) {
-          setQuickGenerateData(result.data)
-          setGeneratedPlan(null) // Clear preference-based plan
-        }
+        const quickData = await readStreamedJSON(response, undefined, 3000, (partial) => {
+          if (generateAbortRef.current !== abortController) return
+          const sections = detectQuickSections(partial)
+          if (sections.size > 0) {
+            setRevealedSections(prev => {
+              const next = new Set(prev)
+              sections.forEach(s => next.add(s))
+              return next
+            })
+            setQuickGenerateData(partial)
+          }
+        })
+        setQuickGenerateData(quickData)
+        setGeneratedPlan(null)
+        setRevealedSections(new Set(['q-overview', 'q-analytics', 'q-tips']))
+        setStreamingMode(null)
+        setShowCompletionBanner(true)
       } else {
-        // Preference-based Generate - original flow with storage
         const travelersData = tripData.travelerNames.map((name, index) => ({
           name: name || `Traveler ${index + 1}`,
           gender: tripData.travelerGenders[index] || '',
@@ -413,58 +1011,48 @@ export default function TravelSmartPage() {
 
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
-          throw new Error(errorData.error || `HTTP ${response.status}: Failed to save travel plan`)
+          throw new Error(errorData.error || `HTTP ${response.status}: Failed to generate travel plan`)
         }
 
-        result = await response.json()
+        // Real progressive reveal: detect sections as they stream in
+        let planSelected = false
 
-        if (!result.success) {
-          throw new Error(result.error || 'Failed to save travel plan')
-        }
+        const planData = await readStreamedJSON(response, undefined, 12000, (partial) => {
+          if (generateAbortRef.current !== abortController) return
+          const sections = detectStreamSections(partial)
+          if (sections.size > 0) {
+            setRevealedSections(prev => {
+              const next = new Set(prev)
+              sections.forEach(s => next.add(s))
+              return next
+            })
+            setGeneratedPlan(partial)
+            // Select first plan for display once plans are ready
+            if (!planSelected && sections.has('f-plans')) {
+              setSelectedPlan(Object.keys(partial.plans)[0])
+              planSelected = true
+            }
+          }
+        })
 
-        // Store the generated plan from OpenAI
-        if (result.plan) {
-          setGeneratedPlan(result.plan)
-          setQuickGenerateData(null) // Clear quick generate data
-        }
+        // Stream complete — set final data, select recommended plan
+        setGeneratedPlan(planData)
+        setQuickGenerateData(null)
+        setRevealedSections(new Set(['f-plans', 'f-details', 'f-window', 'f-analytics', 'f-sustainability', 'f-alerts', 'f-suggestions']))
+        const planNames = Object.keys(planData.plans || {})
+        if (planNames.length > 1) setSelectedPlan(planNames[1])
+        setStreamingMode(null)
+        setShowCompletionBanner(true)
       }
-
-      // API complete - now animate remaining icons with 1s intervals
-      clearInterval(progressInterval)
-
-      // Icon 2 complete (40%)
-      setGenerationProgress(40)
-      await new Promise(resolve => setTimeout(resolve, 1000))
-
-      // Icon 3 complete (65%)
-      setGenerationProgress(65)
-      await new Promise(resolve => setTimeout(resolve, 1000))
-
-      // Icon 4 complete (85%)
-      setGenerationProgress(85)
-      await new Promise(resolve => setTimeout(resolve, 1000))
-
-      // Show completed (100%)
-      setGenerationProgress(100)
-      await new Promise(resolve => setTimeout(resolve, 500))
-
-      // Close dialog and navigate to results
-      setIsGenerating(false)
-      setCurrentStep('results')
-      setGenerationProgress(0)
-
-      // Scroll to top of page
-      window.scrollTo({ top: 0, behavior: 'smooth' })
 
     } catch (error) {
-      clearInterval(progressInterval)
-      // If user cancelled, silently reset
+      // Only reset state if this is still the active request (not superseded by a new one)
+      if (generateAbortRef.current !== abortController) return
       if (error instanceof DOMException && error.name === 'AbortError') {
-        setGenerationProgress(0)
+        setStreamingMode(null)
         return
       }
-      setIsGenerating(false)
-      setGenerationProgress(0)
+      setStreamingMode(null)
       alert(`Failed to generate travel plan: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
   }
@@ -536,8 +1124,249 @@ export default function TravelSmartPage() {
     setSelectedPlan(plan)
   }
 
-  // Initialize selectedPlan when generatedPlan is loaded
+  // Check if a traveler tab is a friend who submitted via shared trip (read-only)
+  const isFriendSubmitted = useCallback((travelerIndex: number) => {
+    if (!sharedTripData || travelerIndex === 0) return false
+    const participant = sharedTripData.participants?.[travelerIndex]
+    if (!participant) return false
+    return participant.submittedAt !== null && participant.preferences !== null
+  }, [sharedTripData])
+
+  // Sync friends' submitted preferences from shared trip into local state
   useEffect(() => {
+    if (!sharedTripData?.participants) return
+    const participants = sharedTripData.participants as Array<{
+      name: string
+      gender: string
+      submittedAt: string | null
+      preferences: any
+    }>
+
+    let needsUpdate = false
+    const newNames = [...tripData.travelerNames]
+    const newGenders = [...tripData.travelerGenders]
+    const newPrefs = [...preferences]
+
+    // Only sync friends (index 1+), leave creator (index 0) alone
+    for (let i = 1; i < participants.length; i++) {
+      const p = participants[i]
+      if (p.submittedAt && p.preferences) {
+        if (newNames[i] !== p.name || newPrefs[i] !== p.preferences) {
+          newNames[i] = p.name
+          newGenders[i] = p.gender || ''
+          newPrefs[i] = p.preferences
+          needsUpdate = true
+        }
+      }
+    }
+
+    if (needsUpdate) {
+      setTripData(prev => ({ ...prev, travelerNames: newNames, travelerGenders: newGenders }))
+      setPreferences(newPrefs)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sharedTripData])
+
+  // Sync local traveler count to shared trip when creator adds/removes travelers
+  useEffect(() => {
+    if (!sharedTripId) return
+    if (!sharedTripData || sharedTripData.tripDetails?.totalTravelers === tripData.travelers) return
+    fetch(`/api/trips/${sharedTripId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ totalTravelers: tripData.travelers }),
+    })
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data) setSharedTripData(data) })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tripData.travelers, sharedTripId])
+
+  const defaultSharedPrefs = {
+    travelStyle: 'balanced',
+    crowdTolerance: 'avoid-crowd',
+    seasonType: 'no-preference',
+    preferredSeasons: [],
+    safetyOptions: { avoidLateNight: true, preferWellLit: true, verifiedTransport: true },
+    budgetMin: '',
+    budgetMax: '5000',
+    notifications: { crowd: true, weather: true, price: true, safety: true },
+  }
+
+  // Invite Friends: create shared trip
+  const handleInviteFriends = async () => {
+    if (!tripData.destination || !tripData.dateRange?.from || !tripData.dateRange?.to) return
+    setIsCreatingTrip(true)
+
+    try {
+      const response = await fetch('/api/trips', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creatorName: tripData.travelerNames[0] || 'Trip Creator',
+          destination: tripData.destination,
+          startDate: tripData.dateRange.from.toISOString().split('T')[0],
+          endDate: tripData.dateRange.to.toISOString().split('T')[0],
+          totalTravelers: tripData.travelers,
+          seasonContext: peakDetection ? {
+            seasonType: peakOverride ? 'off-peak' : peakDetection.seasonType,
+            preferredSeasons: peakOverride ? [] : peakDetection.overlappingPeriods.map(op => op.name),
+            peakOverride,
+          } : undefined,
+        }),
+      })
+
+      if (!response.ok) throw new Error('Failed to create shared trip')
+
+      const data = await response.json()
+      setSharedTripId(data.tripId)
+      setCreatorParticipantId(data.creatorParticipantId)
+
+      // Fetch the full trip data
+      const tripResponse = await fetch(`/api/trips/${data.tripId}`)
+      if (tripResponse.ok) {
+        setSharedTripData(await tripResponse.json())
+      }
+
+    } catch (error) {
+      alert(`Failed to create shared trip: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    } finally {
+      setIsCreatingTrip(false)
+    }
+  }
+
+  // Refresh shared trip status
+  const refreshTripStatus = async () => {
+    if (!sharedTripId) return
+    try {
+      const response = await fetch(`/api/trips/${sharedTripId}`)
+      if (response.ok) {
+        setSharedTripData(await response.json())
+      }
+    } catch {
+      // silently fail
+    }
+  }
+
+  // Generate plan with shared preferences — calls API directly to avoid React state timing issues
+  const handleGenerateWithSharedPreferences = async () => {
+    if (!sharedTripData) return
+
+    const participants = sharedTripData.participants as Array<{
+      name: string
+      gender: string
+      preferences: any
+    }>
+
+    // Creator is participants[0] — use their local preferences or defaults
+    // Friends are participants[1+] — use their submitted preferences
+    const names = participants.map(p => p.name)
+    const genders = participants.map(p => p.gender || '')
+    const prefs = participants.map((p, i) =>
+      i === 0 ? (preferences[0] || defaultSharedPrefs) : (p.preferences || defaultSharedPrefs)
+    )
+
+    // Update local state for the results view
+    setTripData(prev => ({
+      ...prev,
+      travelers: participants.length,
+      travelerNames: names,
+      travelerGenders: genders,
+    }))
+    setPreferences(prefs)
+
+    // Build request directly from shared data (don't rely on React state)
+    generateAbortRef.current?.abort()
+    const abortController = new AbortController()
+    generateAbortRef.current = abortController
+
+    // Clear old data and revealed sections so all skeletons show
+    setGeneratedPlan(null)
+    setQuickGenerateData(null)
+    setRevealedSections(new Set())
+
+    // Navigate to results immediately with skeleton loading
+    setStreamingMode('full')
+    setShowCompletionBanner(false)
+    setCurrentStep('results')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+
+    try {
+      const travelersData = names.map((name, index) => ({
+        name: name || `Traveler ${index + 1}`,
+        gender: genders[index] || '',
+        preferences: prefs[index] || defaultSharedPrefs,
+      }))
+
+      const requestData = {
+        group_id: `group-${participants.length}`,
+        trip_details: {
+          destination: sharedTripData.tripDetails.destination,
+          start_date: sharedTripData.tripDetails.startDate,
+          end_date: sharedTripData.tripDetails.endDate,
+        },
+        travelers: travelersData,
+      }
+
+      const response = await fetch('/api/generate-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestData),
+        signal: abortController.signal,
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
+        throw new Error(errorData.error || `HTTP ${response.status}: Failed to generate plan`)
+      }
+
+      // Real progressive reveal: detect sections as they stream in
+      let planSelected = false
+
+      const planData = await readStreamedJSON(response, undefined, 12000, (partial) => {
+        if (generateAbortRef.current !== abortController) return
+        const sections = detectStreamSections(partial)
+        if (sections.size > 0) {
+          setRevealedSections(prev => {
+            const next = new Set(prev)
+            sections.forEach(s => next.add(s))
+            return next
+          })
+          setGeneratedPlan(partial)
+          if (!planSelected && sections.has('f-plans')) {
+            setSelectedPlan(Object.keys(partial.plans)[0])
+            planSelected = true
+          }
+        }
+      })
+
+      setGeneratedPlan(planData)
+      setQuickGenerateData(null)
+      setRevealedSections(new Set(['f-plans', 'f-details', 'f-window', 'f-analytics', 'f-sustainability', 'f-alerts', 'f-suggestions']))
+      const planNames = Object.keys(planData.plans || {})
+      if (planNames.length > 1) setSelectedPlan(planNames[1])
+      setStreamingMode(null)
+      setShowCompletionBanner(true)
+    } catch (error) {
+      if (generateAbortRef.current !== abortController) return
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        setStreamingMode(null)
+        return
+      }
+      setStreamingMode(null)
+      alert(`Failed to generate travel plan: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    }
+  }
+
+  // Clear shared trip state on page load (fresh start)
+  useEffect(() => {
+    sessionStorage.removeItem('sharedTripId')
+    sessionStorage.removeItem('creatorParticipantId')
+  }, [])
+
+  // Initialize selectedPlan when generatedPlan is loaded (skip during streaming — handled on completion)
+  useEffect(() => {
+    if (streamingMode !== null) return
     if (generatedPlan?.plans && Object.keys(generatedPlan.plans).length > 0) {
       const planNames = Object.keys(generatedPlan.plans);
       if (!generatedPlan.plans[selectedPlan]) {
@@ -545,7 +1374,7 @@ export default function TravelSmartPage() {
         setSelectedPlan(defaultPlan);
       }
     }
-  }, [generatedPlan?.plans, selectedPlan])
+  }, [generatedPlan?.plans, selectedPlan, streamingMode])
 
   const formatDate = (date: Date | string | undefined) => {
     try {
@@ -783,140 +1612,73 @@ export default function TravelSmartPage() {
 
   return (
     <PageLayout showFlowGuide={false} maxWidth="lg" background="minimal" className="font-sans theme-rose">
-      {/* Generating Modal */}
-      <Dialog open={isGenerating} onOpenChange={(open) => {
-        if (!open) {
-          generateAbortRef.current?.abort()
-          setIsGenerating(false)
-          setGenerationProgress(0)
-        }
-      }}>
-        <DialogContent showCloseButton={false} className="sm:max-w-md border-0 shadow-2xl bg-white theme-rose overflow-hidden p-0 font-[family-name:var(--font-geist-sans)]">
-          {/* Accessibility title - visually hidden */}
-          <DialogTitle className="sr-only">Generating your travel plan</DialogTitle>
-
-          {/* Animated gradient background */}
-          <div className="absolute inset-0 overflow-hidden">
-            <div className="absolute inset-0 bg-gradient-to-br from-rose-50 via-white to-orange-50" />
-            <div
-              className="absolute w-[500px] h-[500px] -top-48 -right-48 rounded-full opacity-60"
-              style={{
-                background: 'radial-gradient(circle, rgba(251,113,133,0.3) 0%, transparent 70%)',
-                animation: 'pulse 4s ease-in-out infinite'
-              }}
-            />
-            <div
-              className="absolute w-[400px] h-[400px] -bottom-32 -left-32 rounded-full opacity-50"
-              style={{
-                background: 'radial-gradient(circle, rgba(253,164,175,0.3) 0%, transparent 70%)',
-                animation: 'pulse 4s ease-in-out infinite 1s'
-              }}
-            />
+      {/* Completion Banner with Confetti */}
+      {showCompletionBanner && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom fade-in duration-300">
+          {/* Confetti particles around the container edges */}
+          <div className="absolute -inset-2 pointer-events-none overflow-visible">
+            {Array.from({ length: 30 }).map((_, i) => {
+              // Place particles along the perimeter of the pill
+              const t = i / 30
+              // Pill perimeter: top edge, right cap, bottom edge, left cap
+              let startX: number, startY: number
+              if (t < 0.3) {
+                // Top edge
+                startX = 10 + (t / 0.3) * 80
+                startY = 0
+              } else if (t < 0.45) {
+                // Right side
+                startX = 90 + Math.random() * 10
+                startY = ((t - 0.3) / 0.15) * 100
+              } else if (t < 0.75) {
+                // Bottom edge
+                startX = 90 - ((t - 0.45) / 0.3) * 80
+                startY = 100
+              } else {
+                // Left side
+                startX = Math.random() * 10
+                startY = 100 - ((t - 0.75) / 0.25) * 100
+              }
+              // Fly outward from edge
+              const cx = 50, cy = 50
+              const dx = startX - cx, dy = startY - cy
+              const outDist = 40 + Math.random() * 50
+              const tx = (dx / 50) * outDist
+              const ty = (dy / 50) * outDist - 15
+              const colors = ['#f43f5e', '#10b981', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899']
+              const color = colors[i % colors.length]
+              const size = 3 + Math.random() * 5
+              const shapes = ['rounded-full', 'rounded-sm']
+              const shape = shapes[i % shapes.length]
+              const delay = Math.random() * 0.3
+              return (
+                <div
+                  key={i}
+                  className={`absolute ${shape} animate-confetti-explode`}
+                  style={{
+                    width: size,
+                    height: i % 3 === 0 ? size * 1.5 : size,
+                    backgroundColor: color,
+                    left: `${startX}%`,
+                    top: `${startY}%`,
+                    // @ts-expect-error CSS custom properties
+                    '--tx': `${tx}px`,
+                    '--ty': `${ty}px`,
+                    animationDelay: `${delay}s`,
+                  }}
+                />
+              )
+            })}
           </div>
-
-          <div className="relative z-10 px-8 py-10">
-            {/* Main visual */}
-            <div className="flex flex-col items-center text-center mb-8">
-              {/* Animated globe icon */}
-              <div className="relative w-24 h-24 mb-6">
-                {/* Orbit path */}
-                <div className="absolute inset-0 rounded-full border-2 border-dashed border-rose-200" />
-
-                {/* Center globe */}
-                <div className="absolute inset-3 rounded-full bg-gradient-to-br from-rose-400 to-rose-600 shadow-lg shadow-rose-500/30 flex items-center justify-center">
-                  <Globe2 className="h-9 w-9 text-white" />
-                </div>
-
-                {/* Orbiting sparkle */}
-                <div className="absolute inset-0 animate-[spin_3s_linear_infinite]">
-                  <div className="absolute -top-1.5 left-1/2 -translate-x-1/2">
-                    <Sparkles className="h-4 w-4 text-rose-500" />
-                  </div>
-                </div>
-              </div>
-
-              <h2 className="text-xl font-semibold text-gray-900 tracking-tight" aria-hidden="true">
-                Crafting Your Journey
-              </h2>
-              <p className="text-sm text-gray-500 mt-1.5 max-w-[320px] leading-relaxed">
-                We're personalizing every detail to create your perfect travel experience based on your preferences
-              </p>
+          <div className="relative flex items-center gap-2 px-5 py-3 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-600 text-white shadow-lg shadow-emerald-500/25 animate-scale-up">
+            <div className="flex items-center justify-center w-5 h-5 rounded-full bg-white/20">
+              <CheckCircle2 className="h-3.5 w-3.5" />
             </div>
-
-            {/* Step indicators - simple version without complex state */}
-            <div className="flex justify-center gap-3 mb-8">
-              {[
-                { icon: Brain, label: 'Preferences' },
-                { icon: MapPinIcon, label: 'Routes' },
-                { icon: CloudRain, label: 'Conditions' },
-                { icon: Sparkles, label: 'Finalize' },
-              ].map((step, i) => {
-                const thresholds = [15, 40, 65, 85]
-                const prevThresholds = [0, 15, 40, 65]
-                const isComplete = generationProgress >= thresholds[i]
-                const isActive = !isComplete && generationProgress >= prevThresholds[i]
-                const Icon = step.icon
-
-                return (
-                  <div key={i} className="relative">
-                    <div
-                      className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors duration-300 ${
-                        isComplete
-                          ? 'bg-rose-500 text-white'
-                          : isActive
-                            ? 'bg-rose-100 text-rose-600 ring-2 ring-rose-300 ring-offset-2'
-                            : 'bg-gray-100 text-gray-400'
-                      }`}
-                    >
-                      {isComplete ? (
-                        <CheckCircle2 className="h-5 w-5" />
-                      ) : (
-                        <Icon className="h-4 w-4" />
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-
-            {/* Current action text */}
-            <div className="text-center mb-6">
-              <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full border transition-colors duration-300 ${
-                generationProgress >= 100
-                  ? 'bg-emerald-50 border-emerald-200'
-                  : 'bg-rose-50 border-rose-100'
-              }`}>
-                {generationProgress >= 100 ? (
-                  <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-                ) : (
-                  <div className="flex gap-0.5">
-                    <span className="w-1 h-1 rounded-full bg-rose-400 animate-[bounce_1s_ease-in-out_infinite]" style={{ animationDelay: '0s' }} />
-                    <span className="w-1 h-1 rounded-full bg-rose-400 animate-[bounce_1s_ease-in-out_infinite]" style={{ animationDelay: '0.2s' }} />
-                    <span className="w-1 h-1 rounded-full bg-rose-400 animate-[bounce_1s_ease-in-out_infinite]" style={{ animationDelay: '0.4s' }} />
-                  </div>
-                )}
-                <span className={`text-sm font-medium transition-colors duration-300 ${
-                  generationProgress >= 100 ? 'text-emerald-700' : 'text-rose-700'
-                }`}>
-                  {generationProgress < 15 && 'Analyzing your preferences...'}
-                  {generationProgress >= 15 && generationProgress < 40 && 'Finding optimal routes...'}
-                  {generationProgress >= 40 && generationProgress < 65 && 'Checking local conditions...'}
-                  {generationProgress >= 65 && generationProgress < 100 && 'Finalizing your itinerary...'}
-                  {generationProgress >= 100 && 'Completed! Redirecting...'}
-                </span>
-              </div>
-            </div>
-
-            {/* Cancel button */}
-            <button
-              className="w-full py-3 rounded-xl text-sm font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition-all duration-200"
-              onClick={() => setIsGenerating(false)}
-            >
-              Wait, let me reconsider
-            </button>
+            <span className="text-sm font-semibold">Your plan is ready!</span>
+            <Sparkles className="h-3.5 w-3.5 text-emerald-200 animate-pulse" />
           </div>
-        </DialogContent>
-      </Dialog>
+        </div>
+      )}
 
       <div className="transition-all duration-300">
         {/* STEP 1: Trip Details */}
@@ -1093,6 +1855,91 @@ export default function TravelSmartPage() {
                     </div>
                   </div>
 
+                  {/* Travel Period Detection (appears after dates are selected) */}
+                  {peakDetection && (
+                    <div className="space-y-2 animate-slide-up-fade" style={{ animationFillMode: 'both' }}>
+                      {(peakDetection.seasonType === 'peak' || peakDetection.seasonType === 'mixed') && !peakOverride ? (
+                        <div className={`p-3 rounded-lg border ${peakDetection.seasonType === 'mixed' ? 'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800' : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800'}`}>
+                          <div className="flex items-start gap-2 mb-2">
+                            <AlertTriangle className={`h-4 w-4 mt-0.5 flex-shrink-0 ${peakDetection.seasonType === 'mixed' ? 'text-blue-500' : 'text-amber-500'}`} />
+                            <div>
+                              <p className={`text-sm font-medium ${peakDetection.seasonType === 'mixed' ? 'text-blue-700 dark:text-blue-300' : 'text-amber-700 dark:text-amber-300'}`}>
+                                {peakDetection.seasonType === 'mixed' ? 'Mixed Period Detected' : 'Peak Period Detected'}
+                              </p>
+                              <p className="text-xs text-muted-foreground mt-0.5">{peakDetection.summary}</p>
+                            </div>
+                          </div>
+                          <div className="space-y-1.5 mt-2">
+                            {peakDetection.overlappingPeriods.map((period) => (
+                              <div key={period.name} className={`flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs ${peakDetection.seasonType === 'mixed' ? 'bg-blue-100 dark:bg-blue-900/40' : 'bg-amber-100 dark:bg-amber-900/40'}`}>
+                                <span className="font-medium">{period.name}</span>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-muted-foreground">{period.dateRange}</span>
+                                  <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                                    {period.type === 'holiday' ? 'Holiday' : period.type === 'school-break' ? 'School Break' : 'Event'}
+                                  </Badge>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="flex items-center justify-between mt-3 pt-2 border-t border-amber-200 dark:border-amber-800">
+                            <Label htmlFor="peak-override-step1" className="text-xs text-muted-foreground cursor-pointer">
+                              Override: Optimize for off-peak instead?
+                            </Label>
+                            <Switch
+                              id="peak-override-step1"
+                              checked={peakOverride}
+                              onCheckedChange={(checked) => {
+                                setPeakOverride(checked)
+                              }}
+                            />
+                          </div>
+                        </div>
+                      ) : peakDetection.seasonType === 'off-peak' || peakOverride ? (
+                        <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800">
+                          <div className="flex items-start gap-2 mb-2">
+                            <Leaf className="h-4 w-4 mt-0.5 text-emerald-500 flex-shrink-0" />
+                            <div>
+                              <p className="text-sm font-medium text-emerald-700 dark:text-emerald-300">Off-Peak Optimization</p>
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                {peakOverride
+                                  ? 'AI will prioritize lower prices and quieter spots, even though your dates overlap with peak periods.'
+                                  : peakDetection.summary}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-1.5 mt-2">
+                            {[
+                              { label: 'Lower prices', icon: TrendingDown },
+                              { label: 'Fewer crowds', icon: Users },
+                              { label: 'Better availability', icon: CalendarCheck },
+                              { label: 'Sustainable travel', icon: Leaf },
+                            ].map((benefit) => (
+                              <div key={benefit.label} className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-xs text-emerald-700 dark:text-emerald-300">
+                                <benefit.icon className="h-3 w-3" />
+                                <span>{benefit.label}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {peakOverride && (
+                            <div className="flex items-center justify-between mt-3 pt-2 border-t border-emerald-200 dark:border-emerald-800">
+                              <Label htmlFor="peak-override-step1" className="text-xs text-muted-foreground cursor-pointer">
+                                Override: Optimize for off-peak instead?
+                              </Label>
+                              <Switch
+                                id="peak-override-step1"
+                                checked={peakOverride}
+                                onCheckedChange={(checked) => {
+                                  setPeakOverride(checked)
+                                }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+
                   {/* Quick Generate Toggle */}
                   <div className="pt-2">
                     <div className="relative overflow-visible">
@@ -1163,6 +2010,7 @@ export default function TravelSmartPage() {
                       <>Continue to Preferences <ArrowRight className="ml-2 h-5 w-5" /></>
                     )}
                   </Button>
+
                 </div>
               </CardContent>
             </Card>
@@ -1193,6 +2041,17 @@ export default function TravelSmartPage() {
                 </Button>
               </div>
             </div>
+
+            {/* Off-peak override banner */}
+            {peakOverride && peakDetection && (peakDetection.seasonType === 'peak' || peakDetection.seasonType === 'mixed') && (
+              <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 animate-slide-up-fade">
+                <Info className="h-4 w-4 text-emerald-500 flex-shrink-0" />
+                <p className="text-xs text-emerald-700 dark:text-emerald-300">
+                  <span className="font-medium">Off-peak override active</span>
+                  <span className="text-emerald-600 dark:text-emerald-400"> — Your dates overlap with {peakDetection.overlappingPeriods.map(p => p.name).join(', ')}, but the AI will optimize for lower prices and quieter spots.</span>
+                </p>
+              </div>
+            )}
 
             {/* Traveler Management Section */}
             <div className="mb-4 space-y-3">
@@ -1309,15 +2168,150 @@ export default function TravelSmartPage() {
               )}
             </div>
 
+            {/* Invite Friends Section - shown when travelers > 1 */}
+            {tripData.travelers > 1 && (
+              <Card className="border-rose-200 bg-rose-50/30">
+                <CardContent className="p-4">
+                  {!sharedTripId ? (
+                    /* No shared trip yet — show invite button */
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-lg bg-rose-100 flex items-center justify-center shrink-0">
+                          <UserPlus className="h-4 w-4 text-rose-500" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium">Invite Friends</p>
+                          <p className="text-xs text-muted-foreground">Let friends set their own preferences via a shareable link</p>
+                        </div>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0 border-rose-200 text-rose-600 hover:bg-rose-50 hover:border-rose-300 gap-1.5"
+                        onClick={handleInviteFriends}
+                        disabled={isCreatingTrip}
+                      >
+                        {isCreatingTrip ? (
+                          <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Creating...</>
+                        ) : (
+                          <><Link className="h-3.5 w-3.5" /> Get Link</>
+                        )}
+                      </Button>
+                    </div>
+                  ) : (
+                    /* Shared trip exists — show link + participant status */
+                    <div className="space-y-3">
+                      {/* Link row */}
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 relative">
+                          <Input
+                            readOnly
+                            value={typeof window !== 'undefined' ? `${window.location.origin}/predictions/join/${sharedTripId}` : ''}
+                            className="h-9 text-xs bg-white font-mono pr-3"
+                          />
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={`h-9 gap-1.5 shrink-0 transition-all duration-200 ${
+                            linkCopied
+                              ? 'bg-emerald-50 border-emerald-300 text-emerald-600 hover:bg-emerald-50'
+                              : 'border-rose-200 text-rose-600 hover:bg-rose-50'
+                          }`}
+                          onClick={() => {
+                            navigator.clipboard.writeText(`${window.location.origin}/predictions/join/${sharedTripId}`)
+                            setLinkCopied(true)
+                            setTimeout(() => setLinkCopied(false), 2000)
+                          }}
+                        >
+                          {linkCopied ? <><CheckCircle2 className="h-3.5 w-3.5" /> Copied</> : <><Copy className="h-3.5 w-3.5" /> Copy</>}
+                        </Button>
+                      </div>
+
+                      {/* Participant status */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium text-muted-foreground">
+                            {sharedTripData?.participants?.length || 1} of {tripData.travelers} joined
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 gap-1 text-[11px] text-muted-foreground hover:text-foreground px-2"
+                            onClick={refreshTripStatus}
+                          >
+                            <RefreshCw className="h-3 w-3" /> Refresh
+                          </Button>
+                        </div>
+                        {sharedTripData?.participants?.map((p: any, i: number) => (
+                          <div key={p.id} className="flex items-center justify-between px-2.5 py-1.5 rounded-md bg-white border text-sm">
+                            <div className="flex items-center gap-2">
+                              <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold ${
+                                i === 0 ? 'bg-rose-100 text-rose-600' : p.submittedAt ? 'bg-emerald-100 text-emerald-600' : 'bg-gray-100 text-gray-400'
+                              }`}>
+                                {p.name?.charAt(0)?.toUpperCase() || '?'}
+                              </div>
+                              <span className="text-sm">{p.name}</span>
+                              {i === 0 && <Badge variant="secondary" className="text-[10px] px-1.5 py-0">You</Badge>}
+                            </div>
+                            {i === 0 ? (
+                              <span className="text-[11px] text-muted-foreground">Creator</span>
+                            ) : (
+                              <Badge
+                                variant={p.submittedAt ? 'default' : 'outline'}
+                                className={
+                                  p.submittedAt
+                                    ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-100 border-emerald-200 text-[11px]'
+                                    : 'text-amber-600 border-amber-200 bg-amber-50 hover:bg-amber-50 text-[11px]'
+                                }
+                              >
+                                {p.submittedAt ? 'Submitted' : 'Pending'}
+                              </Badge>
+                            )}
+                          </div>
+                        ))}
+                        {(sharedTripData?.participants?.length || 1) < tripData.travelers &&
+                          Array.from({ length: tripData.travelers - (sharedTripData?.participants?.length || 1) }).map((_: unknown, i: number) => (
+                            <div key={`empty-${i}`} className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-dashed border-gray-200">
+                              <div className="w-5 h-5 rounded-full border border-dashed border-gray-300 flex items-center justify-center">
+                                <UserPlus className="h-2.5 w-2.5 text-gray-300" />
+                              </div>
+                              <span className="text-xs text-muted-foreground">Waiting to join...</span>
+                            </div>
+                          ))
+                        }
+                      </div>
+                      <p className="text-[11px] text-muted-foreground flex items-start gap-1.5">
+                        <Info className="h-3 w-3 mt-0.5 shrink-0 text-rose-400" />
+                        Hit refresh to see updated status. Friends&apos; preferences will appear in their tabs once submitted.
+                      </p>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Friend submitted read-only banner */}
+            {isFriendSubmitted(currentTravelerIndex) && (
+              <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-emerald-50 border border-emerald-200">
+                <CheckCircle2 className="h-4 w-4 text-emerald-500 shrink-0" />
+                <p className="text-xs text-emerald-700">
+                  <span className="font-medium">{tripData.travelerNames[currentTravelerIndex]}</span> has submitted their preferences. These fields are read-only.
+                </p>
+              </div>
+            )}
+
             {(() => {
               const currentPrefs = preferences[currentTravelerIndex] || preferences[0]
+              const isReadOnly = isFriendSubmitted(currentTravelerIndex)
               const updateCurrentPrefs = (updates: Partial<Preferences>) => {
+                if (isReadOnly) return
                 const updated = [...preferences]
                 updated[currentTravelerIndex] = { ...updated[currentTravelerIndex], ...updates }
                 setPreferences(updated)
               }
               return (
-                <div className="grid sm:grid-cols-2 gap-4">
+                <div className={`grid sm:grid-cols-2 gap-4 ${isReadOnly ? 'pointer-events-none opacity-75' : ''}`}>
                   {/* Left Column */}
                   <div className="space-y-3">
                     {/* Traveler Details */}
@@ -1338,16 +2332,18 @@ export default function TravelSmartPage() {
                               placeholder={`Enter traveler name`}
                               value={tripData.travelerNames[currentTravelerIndex] || ''}
                               autoComplete="off"
+                              disabled={isReadOnly}
                               aria-invalid={shouldShowFieldError(currentTravelerIndex, 'name')}
                               onBlur={() => markTouched(currentTravelerIndex, 'name')}
                               onChange={(e) => {
+                                if (isReadOnly) return
                                 const updatedNames = [...tripData.travelerNames]
                                 updatedNames[currentTravelerIndex] = e.target.value
                                 setTripData({ ...tripData, travelerNames: updatedNames })
                               }}
                               className="h-10"
                             />
-                            {shouldShowFieldError(currentTravelerIndex, 'name') && (
+                            {!isReadOnly && shouldShowFieldError(currentTravelerIndex, 'name') && (
                               <p className="text-sm text-destructive mt-1">Name is required</p>
                             )}
                           </div>
@@ -1355,7 +2351,9 @@ export default function TravelSmartPage() {
                             <Label htmlFor={`gender-${currentTravelerIndex}`} className="text-sm text-muted-foreground">Gender</Label>
                             <Select
                               value={tripData.travelerGenders[currentTravelerIndex] || ''}
+                              disabled={isReadOnly}
                               onValueChange={(value) => {
+                                if (isReadOnly) return
                                 const updatedGenders = [...tripData.travelerGenders]
                                 updatedGenders[currentTravelerIndex] = value
                                 setTripData({ ...tripData, travelerGenders: updatedGenders })
@@ -1378,7 +2376,7 @@ export default function TravelSmartPage() {
                                 <SelectItem value="prefer-not-to-say">Prefer not to say</SelectItem>
                               </SelectContent>
                             </Select>
-                            {shouldShowFieldError(currentTravelerIndex, 'gender') && (
+                            {!isReadOnly && shouldShowFieldError(currentTravelerIndex, 'gender') && (
                               <p className="text-sm text-destructive mt-1">Gender is required</p>
                             )}
                           </div>
@@ -1523,56 +2521,90 @@ export default function TravelSmartPage() {
 
                   {/* Right Column */}
                   <div className="space-y-3">
-                    {/* Season Preference */}
+                    {/* Travel Period */}
                     <Card className="animate-slide-up-fade" style={{ animationDelay: '0.1s', animationFillMode: 'both' }}>
                       <CardHeader className="pb-2 pt-3 px-4">
                         <CardTitle className="text-sm font-medium flex items-center gap-2">
                           <Calendar className="h-4 w-4 text-rose-500" />
-                          Season Preference
+                          Travel Period
                         </CardTitle>
-                        <p className="text-sm text-muted-foreground">Select all that apply</p>
                       </CardHeader>
-                      <CardContent className="px-4 pb-4">
-                        {shouldShowFieldError(currentTravelerIndex, 'seasons') && (
-                          <p className="text-sm text-destructive mb-2">Select at least one season</p>
-                        )}
-                        <div className={`grid grid-cols-2 gap-2 ${shouldShowFieldError(currentTravelerIndex, 'seasons') ? 'ring-1 ring-destructive rounded-lg p-1' : ''}`}>
-                          {[
-                            { value: 'chinese-new-year', label: 'Chinese New Year' },
-                            { value: 'hari-raya-aidilfitri', label: 'Hari Raya Aidilfitri' },
-                            { value: 'hari-raya-haji', label: 'Hari Raya Haji' },
-                            { value: 'deepavali', label: 'Deepavali' },
-                            { value: 'thaipusam', label: 'Thaipusam' },
-                            { value: 'wesak', label: 'Wesak Day' },
-                            { value: 'christmas', label: 'Christmas' },
-                            { value: 'merdeka', label: 'Merdeka Day' },
-                            { value: 'malaysia-day', label: 'Malaysia Day' },
-                            { value: 'school-holidays', label: 'School Holidays' },
-                          ].map((season) => (
-                            <Label
-                              key={season.value}
-                              htmlFor={`season-${season.value}`}
-                              className={`flex items-center gap-2 px-3 py-2 border rounded-lg cursor-pointer transition-all ${
-                                currentPrefs.preferredSeasons.includes(season.value)
+                      <CardContent className="px-4 pb-3">
+                        {!peakDetection ? (
+                          <div className="p-3 rounded-lg bg-muted/50 border border-dashed">
+                            <p className="text-xs text-muted-foreground text-center">
+                              No dates selected — go back to Step 1 to pick travel dates.
+                            </p>
+                          </div>
+                        ) : (() => {
+                          const effectiveType = peakOverride ? 'off-peak' : peakDetection.seasonType
+                          return (
+                            <>
+                              {/* Detected season — styled like a selected radio option */}
+                              <div className={`flex items-center gap-3 p-3 border rounded-lg transition-all ${
+                                effectiveType === 'off-peak'
                                   ? 'border-rose-500 bg-rose-50'
-                                  : 'border-border hover:border-rose-300'
-                              }`}
-                            >
-                              <Checkbox
-                                id={`season-${season.value}`}
-                                checked={currentPrefs.preferredSeasons.includes(season.value)}
-                                onCheckedChange={(checked) => {
-                                  const newSeasons = checked
-                                    ? [...currentPrefs.preferredSeasons, season.value]
-                                    : currentPrefs.preferredSeasons.filter(s => s !== season.value)
-                                  updateCurrentPrefs({ preferredSeasons: newSeasons })
-                                  markTouched(currentTravelerIndex, 'seasons')
-                                }}
-                              />
-                              <span className="text-sm">{season.label}</span>
-                            </Label>
-                          ))}
-                        </div>
+                                  : effectiveType === 'mixed'
+                                  ? 'border-rose-500 bg-rose-50'
+                                  : 'border-rose-500 bg-rose-50'
+                              }`}>
+                                <div className="w-4 h-4 rounded-full border-2 border-rose-500 flex items-center justify-center flex-shrink-0">
+                                  <div className="w-2 h-2 rounded-full bg-rose-500" />
+                                </div>
+                                <div className="flex-1">
+                                  <div className="text-sm font-medium">
+                                    {effectiveType === 'off-peak' ? 'Off-Peak Season' : effectiveType === 'mixed' ? 'Mixed Season' : 'Peak Season'}
+                                    {peakOverride && <span className="text-xs font-normal text-muted-foreground ml-1">(overridden)</span>}
+                                  </div>
+                                  <div className="text-sm text-muted-foreground">
+                                    {effectiveType === 'off-peak'
+                                      ? 'Lower prices, fewer crowds'
+                                      : effectiveType === 'peak'
+                                      ? 'Higher demand, festive atmosphere'
+                                      : 'Mix of busy and quiet days'}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Overlapping periods list — styled like switch rows */}
+                              {peakDetection.overlappingPeriods.length > 0 && !peakOverride && (
+                                <div className="mt-2">
+                                  {peakDetection.overlappingPeriods.map((period) => (
+                                    <div key={period.name} className="flex items-center justify-between py-2">
+                                      <div className="flex items-center gap-2">
+                                        <CalendarCheck className="h-3.5 w-3.5 text-rose-500" />
+                                        <Label className="text-sm">{period.name}</Label>
+                                      </div>
+                                      <span className="text-sm text-muted-foreground">{period.dateRange}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* Optimize toggle — styled like safety/alert switches */}
+                              {(peakDetection.seasonType === 'peak' || peakDetection.seasonType === 'mixed') && (
+                                <div className="flex items-center justify-between py-2 mt-1 border-t">
+                                  <Label htmlFor="peak-override-step2" className="text-sm cursor-pointer">Optimize for off-peak</Label>
+                                  <Switch
+                                    id="peak-override-step2"
+                                    checked={peakOverride}
+                                    onCheckedChange={(checked) => {
+                                      setPeakOverride(checked)
+                                      if (checked) {
+                                        updateCurrentPrefs({ seasonType: 'off-peak', preferredSeasons: [] })
+                                      } else if (peakDetection) {
+                                        updateCurrentPrefs({
+                                          seasonType: peakDetection.seasonType,
+                                          preferredSeasons: peakDetection.overlappingPeriods.map(op => op.name),
+                                        })
+                                      }
+                                    }}
+                                  />
+                                </div>
+                              )}
+                            </>
+                          )
+                        })()}
                       </CardContent>
                     </Card>
 
@@ -1657,19 +2689,57 @@ export default function TravelSmartPage() {
             })()}
 
             {/* Submit Button */}
-            <div className="pt-4">
-              <Button
-                className="w-full h-11 font-semibold bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 shadow-lg shadow-rose-500/20"
-                onClick={handlePreferencesSubmit}
-              >
-                Generate Travel Plan
-                <Sparkles className="ml-2 h-4 w-4" />
-              </Button>
-              {submitAttempted && !isPreferencesValid && (
-                <p className="text-sm text-destructive text-center mt-2">
-                  Please fill in all required fields for each traveler
-                </p>
-              )}
+            <div className="pt-4 space-y-2">
+              {(() => {
+                // If shared trip exists, check if friends have submitted
+                const friends = sharedTripData?.participants?.slice(1) || []
+                const allFriendsSubmitted = sharedTripData &&
+                  sharedTripData.participants?.length >= sharedTripData.tripDetails?.totalTravelers &&
+                  friends.length > 0 &&
+                  friends.every((p: any) => p.submittedAt !== null)
+                const isSharedReady = sharedTripData?.status === 'ready' || allFriendsSubmitted
+
+                if (sharedTripId && isSharedReady) {
+                  return (
+                    <Button
+                      className="w-full h-11 font-semibold bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 shadow-lg shadow-rose-500/20"
+                      onClick={handleGenerateWithSharedPreferences}
+                    >
+                      Generate Plan with Everyone&apos;s Preferences
+                      <Sparkles className="ml-2 h-4 w-4" />
+                    </Button>
+                  )
+                }
+
+                if (sharedTripId && !isSharedReady) {
+                  return (
+                    <Button
+                      className="w-full h-11 font-semibold bg-gray-100 text-gray-400 shadow-none cursor-not-allowed"
+                      disabled
+                    >
+                      Waiting for friends to submit preferences...
+                    </Button>
+                  )
+                }
+
+                // Normal flow — no shared trip
+                return (
+                  <>
+                    <Button
+                      className="w-full h-11 font-semibold bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 shadow-lg shadow-rose-500/20"
+                      onClick={handlePreferencesSubmit}
+                    >
+                      Generate Travel Plan
+                      <Sparkles className="ml-2 h-4 w-4" />
+                    </Button>
+                    {submitAttempted && !isPreferencesValid && (
+                      <p className="text-sm text-destructive text-center mt-2">
+                        Please fill in all required fields for each traveler
+                      </p>
+                    )}
+                  </>
+                )
+              })()}
             </div>
           </div>
         )}
@@ -1692,38 +2762,93 @@ export default function TravelSmartPage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Popover>
-                    <PopoverTrigger asChild>
-                      <Button size="icon" className="h-9 w-9 bg-white/20 hover:bg-white/30 backdrop-blur-sm border-0">
-                        <Share2 className="h-4 w-4 text-white" />
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent align="end" className="w-48 p-2 font-[family-name:var(--font-geist-sans)]">
-                      <p className="text-xs font-medium text-muted-foreground px-2 mb-2">Share this plan</p>
-                      {[
-                        { name: 'WhatsApp', icon: MessageCircle, bg: 'bg-green-500' },
-                        { name: 'Email', icon: Mail, bg: 'bg-blue-500' },
-                        { name: 'Facebook', icon: Facebook, bg: 'bg-blue-600' },
-                        { name: 'Instagram', icon: Instagram, bg: 'bg-gradient-to-br from-purple-500 via-pink-500 to-orange-400' },
-                        { name: 'Threads', icon: AtSign, bg: 'bg-black dark:bg-white dark:text-black' },
-                      ].map((item) => (
+                    <Button
+                      size="sm"
+                      className="h-9 bg-white/20 hover:bg-white/30 backdrop-blur-sm border-0 text-white text-xs font-semibold"
+                      onClick={() => {
+                        setCurrentStep('details')
+                        setGeneratedPlan(null)
+                        setQuickGenerateData(null)
+                        setTripData({
+                          destination: '',
+                          dateRange: undefined,
+                          travelers: 1,
+                          travelerNames: [''],
+                          travelerGenders: ['']
+                        })
+                        setPreferences([{
+                          travelStyle: 'balanced',
+                          crowdTolerance: 'avoid-crowd',
+                          seasonType: 'no-preference',
+                          preferredSeasons: [],
+                          safetyOptions: {
+                            avoidLateNight: true,
+                            preferWellLit: true,
+                            verifiedTransport: true
+                          },
+                          budgetMin: '',
+                          budgetMax: '',
+                          notifications: {
+                            crowd: true,
+                            weather: true,
+                            price: true,
+                            safety: true
+                          }
+                        }])
+                        setCurrentTravelerIndex(0)
+                        setSelectedPlan('Balanced Plan')
+                        setSubmitAttempted(false)
+                        setTouchedFields(new Set())
+                        setPeakOverride(false)
+                      }}
+                    >
+                      <Plus className="h-3.5 w-3.5 sm:mr-1" />
+                      <span className="hidden sm:inline">New Plan</span>
+                    </Button>
+                    {streamingMode === null && (
+                      <>
                         <Button
-                          key={item.name}
-                          variant="ghost"
-                          className="w-full justify-start gap-2.5 h-9 px-2 hover:bg-muted"
-                          onClick={() => {
-                            setSharedPlatform(item.name)
-                            setShowShareSuccess(true)
-                          }}
+                          size="sm"
+                          className="h-9 bg-white hover:bg-white/90 text-rose-600 text-xs font-semibold"
+                          onClick={() => setShowSaveDialog(true)}
                         >
-                          <div className={`w-6 h-6 rounded-md ${item.bg} flex items-center justify-center`}>
-                            <item.icon className="h-3.5 w-3.5 text-white" />
-                          </div>
-                          <span className="text-sm font-medium">{item.name}</span>
+                          <CheckCircle2 className="h-3.5 w-3.5 sm:mr-1" />
+                          <span className="hidden sm:inline">Save Plan</span>
                         </Button>
-                      ))}
-                    </PopoverContent>
-                  </Popover>
+                        <Popover>
+                        <PopoverTrigger asChild>
+                          <Button size="icon" className="h-9 w-9 bg-white/20 hover:bg-white/30 backdrop-blur-sm border-0">
+                            <Share2 className="h-4 w-4 text-white" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent align="end" className="w-48 p-2 font-[family-name:var(--font-geist-sans)]">
+                          <p className="text-xs font-medium text-muted-foreground px-2 mb-2">Share this plan</p>
+                          {[
+                            { name: 'WhatsApp', icon: MessageCircle, bg: 'bg-green-500' },
+                            { name: 'Email', icon: Mail, bg: 'bg-blue-500' },
+                            { name: 'Facebook', icon: Facebook, bg: 'bg-blue-600' },
+                            { name: 'Instagram', icon: Instagram, bg: 'bg-gradient-to-br from-purple-500 via-pink-500 to-orange-400' },
+                            { name: 'Threads', icon: AtSign, bg: 'bg-black dark:bg-white dark:text-black' },
+                          ].map((item) => (
+                            <Button
+                              key={item.name}
+                              variant="ghost"
+                              className="w-full justify-start gap-2.5 h-9 px-2 hover:bg-muted"
+                              onClick={() => {
+                                setSharedPlatform(item.name)
+                                setShowShareSuccess(true)
+                              }}
+                            >
+                              <div className={`w-6 h-6 rounded-md ${item.bg} flex items-center justify-center`}>
+                                <item.icon className="h-3.5 w-3.5 text-white" />
+                              </div>
+                              <span className="text-sm font-medium">{item.name}</span>
+                            </Button>
+                          ))}
+                        </PopoverContent>
+                      </Popover>
+                    </>
+                    )}
                 </div>
               </div>
             </div>
@@ -1753,6 +2878,17 @@ export default function TravelSmartPage() {
                 </div>
               </div>
             </div>
+
+            {/* Off-peak override banner */}
+            {peakOverride && peakDetection && (peakDetection.seasonType === 'peak' || peakDetection.seasonType === 'mixed') && (
+              <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 animate-fade-in-up" style={{ animationDelay: '0.1s', animationFillMode: 'backwards' }}>
+                <Info className="h-4 w-4 text-emerald-500 flex-shrink-0" />
+                <p className="text-xs text-emerald-700 dark:text-emerald-300">
+                  <span className="font-medium">Off-peak override active</span>
+                  <span className="text-emerald-600 dark:text-emerald-400"> — Plans were optimized for lower prices and quieter spots, even though your dates overlap with {peakDetection.overlappingPeriods.map(p => p.name).join(', ')}.</span>
+                </p>
+              </div>
+            )}
 
             {/* Traveler Preferences Dialog */}
             <Dialog open={showAllPreferences} onOpenChange={setShowAllPreferences}>
@@ -1937,11 +3073,11 @@ export default function TravelSmartPage() {
               </DialogContent>
             </Dialog>
 
-            {/* Quick Generate View - Minimal Design */}
-            {quickGenerateData && (
-              <>
-                {/* Quick Overview Section */}
-                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.1s', animationFillMode: 'backwards' }}>
+            {/* Quick Generate View - Minimal Design (per-section progressive reveal) */}
+
+            {/* Quick Overview */}
+            {quickGenerateData && contentVisible.has('q-overview') ? (
+                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   {/* Header */}
                   <div className="flex items-center gap-2 mb-4">
                     <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
@@ -2009,9 +3145,15 @@ export default function TravelSmartPage() {
                     </div>
                   </div>
                 </div>
+            ) : (streamingMode === 'quick' || isSectionExiting('q-overview')) ? (
+              <div className={isSectionExiting('q-overview') ? 'animate-skeleton-exit' : undefined}>
+                <QuickOverviewSkeleton />
+              </div>
+            ) : null}
 
-                {/* Predictive Analytics - Same style as preference-based */}
-                <div className="animate-fade-in-up" style={{ animationDelay: '0.2s', animationFillMode: 'backwards' }}>
+            {/* Predictive Analytics */}
+            {quickGenerateData && contentVisible.has('q-analytics') ? (
+                <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-3">
                     <BarChart3 className="h-4 w-4 text-rose-500" />
                     <h3 className="text-sm font-semibold">Predictive Analytics</h3>
@@ -2217,8 +3359,15 @@ export default function TravelSmartPage() {
                   </div>
                 </div>
 
-                {/* Quick Tips - Same style as preference-based Personalized Suggestions */}
-                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.4s', animationFillMode: 'backwards' }}>
+            ) : (streamingMode === 'quick' || isSectionExiting('q-analytics')) ? (
+              <div className={isSectionExiting('q-analytics') ? 'animate-skeleton-exit' : undefined}>
+                <PredictiveAnalyticsSkeleton delay="0.2s" />
+              </div>
+            ) : null}
+
+            {/* Quick Tips */}
+            {quickGenerateData && contentVisible.has('q-tips') ? (
+                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-4">
                     <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
                       <Lightbulb className="h-4 w-4 text-rose-500" />
@@ -2239,18 +3388,28 @@ export default function TravelSmartPage() {
                     ))}
                   </div>
                 </div>
-              </>
-            )}
+            ) : (streamingMode === 'quick' || isSectionExiting('q-tips')) ? (
+              <div className={isSectionExiting('q-tips') ? 'animate-skeleton-exit' : undefined}>
+                <QuickTipsSkeleton />
+              </div>
+            ) : null}
 
-            {/* Preference-based Plan View */}
-            {generatedPlan && !quickGenerateData && (
-              <>
+            {/* Preference-based Plan View (per-section progressive reveal) */}
+
             {/* Plan Selection */}
-            <div className="animate-fade-in-up" style={{ animationDelay: '0.1s', animationFillMode: 'backwards' }}>
-              <div className="flex items-center gap-2 mb-3">
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-plans') ? (
+            <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
+              <div className="flex items-center gap-2 mb-1">
                 <Sparkles className="h-4 w-4 text-rose-500" />
                 <h3 className="text-sm font-semibold">Choose Your Plan</h3>
               </div>
+              {streamingMode !== null && (
+                <p className="text-xs text-muted-foreground mb-3 flex items-center gap-1.5">
+                  <Loader2 className="h-3 w-3 animate-spin text-rose-400" />
+                  Plan selection will be available once generation is complete
+                </p>
+              )}
+              {streamingMode === null && <div className="mb-2" />}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 {generatedPlan?.plans && Object.entries(generatedPlan.plans).map(([planName, planData]: [string, any], index: number) => {
                   const isSelected = selectedPlan === planName
@@ -2274,11 +3433,15 @@ export default function TravelSmartPage() {
                   return (
                     <div
                       key={planName}
-                      onClick={() => handleSelectPlan(planName)}
-                      className={`relative cursor-pointer rounded-xl border bg-card p-5 transition-all duration-200 h-full flex flex-col animate-fade-in-scale ${
+                      onClick={() => streamingMode === null && handleSelectPlan(planName)}
+                      className={`relative rounded-xl border bg-card p-5 transition-all duration-200 h-full flex flex-col animate-fade-in-scale ${
+                        streamingMode !== null
+                          ? 'opacity-80 cursor-not-allowed'
+                          : 'cursor-pointer'
+                      } ${
                         isSelected
                           ? 'border-rose-500 shadow-md ring-2 ring-rose-500/20'
-                          : 'border-border hover:border-rose-300 hover:shadow-sm'
+                          : streamingMode === null ? 'border-border hover:border-rose-300 hover:shadow-sm' : 'border-border'
                       }`}
                       style={{ animationDelay: `${0.15 + index * 0.1}s`, animationFillMode: 'backwards' }}
                     >
@@ -2428,9 +3591,15 @@ export default function TravelSmartPage() {
               </div>
             </div>
 
+            ) : (streamingMode === 'full' || isSectionExiting('f-plans')) ? (
+              <div className={isSectionExiting('f-plans') ? 'animate-skeleton-exit' : undefined}>
+                <PlanSelectionSkeleton />
+              </div>
+            ) : null}
+
             {/* Plan Details */}
-            {generatedPlan?.plans?.[selectedPlan] && (
-              <div className="animate-fade-in-up" style={{ animationDelay: '0.2s', animationFillMode: 'backwards' }}>
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-details') && generatedPlan?.plans?.[selectedPlan] ? (
+              <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                 <div className="flex items-center gap-2 mb-3">
                   <Info className="h-4 w-4 text-rose-500" />
                   <h3 className="text-sm font-semibold">Plan Details</h3>
@@ -2473,10 +3642,15 @@ export default function TravelSmartPage() {
                   </div>
                 </div>
               </div>
-            )}
+            ) : (streamingMode === 'full' || isSectionExiting('f-details')) ? (
+              <div className={isSectionExiting('f-details') ? 'animate-skeleton-exit' : undefined}>
+                <PlanDetailsSkeleton />
+              </div>
+            ) : null}
 
-                {/* Best Travel Window / Optimal Period */}
-                <div className="animate-fade-in-up" style={{ animationDelay: '0.3s', animationFillMode: 'backwards' }}>
+            {/* Best Travel Window / Optimal Period */}
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-window') ? (
+                <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-3">
                     <Clock className="h-4 w-4 text-rose-500" />
                     <h3 className="text-sm font-semibold">Best Travel Window</h3>
@@ -2520,9 +3694,15 @@ export default function TravelSmartPage() {
                     </div>
                   </div>
                 </div>
+            ) : (streamingMode === 'full' || isSectionExiting('f-window')) ? (
+              <div className={isSectionExiting('f-window') ? 'animate-skeleton-exit' : undefined}>
+                <BestWindowSkeleton />
+              </div>
+            ) : null}
 
-                {/* Predictive Analytics */}
-                <div className="animate-fade-in-up" style={{ animationDelay: '0.4s', animationFillMode: 'backwards' }}>
+            {/* Predictive Analytics */}
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-analytics') ? (
+                <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-3">
                     <BarChart3 className="h-4 w-4 text-rose-500" />
                     <h3 className="text-sm font-semibold">Predictive Analytics</h3>
@@ -2746,9 +3926,15 @@ export default function TravelSmartPage() {
 
                   </div>
                 </div>
+            ) : (streamingMode === 'full' || isSectionExiting('f-analytics')) ? (
+              <div className={isSectionExiting('f-analytics') ? 'animate-skeleton-exit' : undefined}>
+                <PredictiveAnalyticsSkeleton delay="0.4s" />
+              </div>
+            ) : null}
 
-                {/* Sustainability Dashboard */}
-                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.5s', animationFillMode: 'backwards' }}>
+            {/* Sustainability Dashboard */}
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-sustainability') ? (
+                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-4">
                     <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
                       <Leaf className="h-4 w-4 text-rose-500" />
@@ -2839,10 +4025,207 @@ export default function TravelSmartPage() {
                       </div>
                     </div>
                   </div>
-                </div>
 
-                {/* Predictions & Alerts */}
-                <div className="animate-fade-in-up" style={{ animationDelay: '0.6s', animationFillMode: 'backwards' }}>
+                  {/* Sustainability Summary */}
+                  <div className="mt-4 space-y-3">
+                    {/* Overall Score & AI Summary */}
+                    <div className="p-4 bg-background/60 rounded-lg border">
+                      <div className="flex flex-wrap items-center gap-2 mb-3">
+                        <Recycle className="h-4 w-4 text-emerald-500" />
+                        <h4 className="text-sm font-semibold">Sustainability Summary</h4>
+                        <Badge variant="outline" className="text-[10px] border-teal-400 text-teal-600 bg-teal-50 dark:bg-teal-950/30">
+                          <Brain className="h-3 w-3 mr-1" />Predictive Analysis
+                        </Badge>
+                      </div>
+
+                      {/* Score Ring + Summary Text */}
+                      <div className="flex flex-col items-center sm:flex-row sm:items-start gap-3 sm:gap-4 mb-4">
+                        <div className="relative flex items-center justify-center shrink-0">
+                          <svg className="w-16 h-16 -rotate-90" viewBox="0 0 64 64">
+                            <circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" className="text-muted/20" strokeWidth="5" />
+                            <circle cx="32" cy="32" r="28" fill="none"
+                              className={
+                                (sustainability.overallScore || 65) >= 75 ? 'text-emerald-500' :
+                                (sustainability.overallScore || 65) >= 50 ? 'text-blue-500' :
+                                'text-orange-500'
+                              }
+                              strokeWidth="5"
+                              strokeLinecap="round"
+                              strokeDasharray={`${((sustainability.overallScore || 65) / 100) * 175.9} 175.9`}
+                              stroke="currentColor"
+                            />
+                          </svg>
+                          <span className={`absolute text-sm font-bold ${
+                            (sustainability.overallScore || 65) >= 75 ? 'text-emerald-600' :
+                            (sustainability.overallScore || 65) >= 50 ? 'text-blue-600' :
+                            'text-orange-600'
+                          }`}>{sustainability.overallScore || 65}</span>
+                        </div>
+                        <div className="flex-1 min-w-0 text-center sm:text-left">
+                          <div className="flex items-center justify-center sm:justify-start gap-2 mb-1.5">
+                            <Badge variant="outline" className={`text-xs ${
+                              sustainability.overallLabel === 'Excellent' ? 'border-emerald-500 text-emerald-600 bg-emerald-50 dark:bg-emerald-950/30' :
+                              sustainability.overallLabel === 'Good' ? 'border-blue-500 text-blue-600 bg-blue-50 dark:bg-blue-950/30' :
+                              sustainability.overallLabel === 'Moderate' ? 'border-amber-500 text-amber-600 bg-amber-50 dark:bg-amber-950/30' :
+                              'border-orange-500 text-orange-600 bg-orange-50 dark:bg-orange-950/30'
+                            }`}>
+                              {sustainability.overallLabel || 'Moderate'}
+                            </Badge>
+                          </div>
+                          <p className="text-sm text-muted-foreground leading-relaxed">
+                            {sustainability.summary || 'This plan has a moderate sustainability profile. Consider adjusting your travel dates or activities for a lower environmental footprint.'}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Carbon Footprint */}
+                      {sustainability.carbonFootprint && (
+                        <div className="p-3 rounded-lg bg-muted/30 border">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Footprints className="h-3.5 w-3.5 text-muted-foreground" />
+                            <span className="text-sm font-semibold">Carbon Footprint</span>
+                            <Badge variant="outline" className={`text-xs ml-auto ${
+                              sustainability.carbonFootprint.level === 'Low' ? 'border-emerald-400 text-emerald-600' :
+                              sustainability.carbonFootprint.level === 'High' ? 'border-orange-400 text-orange-600' :
+                              'border-blue-400 text-blue-600'
+                            }`}>
+                              {sustainability.carbonFootprint.level}
+                            </Badge>
+                          </div>
+                          <div className="flex flex-wrap items-center justify-between gap-1 text-sm text-muted-foreground">
+                            <span>{sustainability.carbonFootprint.estimate}</span>
+                            <span className={
+                              sustainability.carbonFootprint.comparison?.includes('lower') ? 'text-emerald-600 font-medium' : 'text-orange-600 font-medium'
+                            }>{sustainability.carbonFootprint.comparison}</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Travel Date Assessment */}
+                      {sustainability.travelDateAssessment && (
+                        <div className="pt-3 mt-3 border-t">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Calendar className="h-4 w-4 text-blue-500" />
+                            <span className="text-sm font-semibold">Travel Date Assessment</span>
+                          </div>
+                          <div className="grid sm:grid-cols-2 gap-2">
+                            <div className={`p-2.5 rounded-lg border ${
+                              sustainability.travelDateAssessment.currentDates?.suitability === 'Suitable' ? 'bg-emerald-50/50 border-emerald-200 dark:bg-emerald-950/20 dark:border-emerald-800' :
+                              sustainability.travelDateAssessment.currentDates?.suitability === 'Not Ideal' ? 'bg-orange-50/50 border-orange-200 dark:bg-orange-950/20 dark:border-orange-800' :
+                              'bg-amber-50/50 border-amber-200 dark:bg-amber-950/20 dark:border-amber-800'
+                            }`}>
+                              <div className="flex items-center gap-2 mb-1">
+                                {sustainability.travelDateAssessment.currentDates?.suitability === 'Suitable' ? (
+                                  <CalendarCheck className="h-3.5 w-3.5 text-emerald-500" />
+                                ) : (
+                                  <CalendarX className="h-3.5 w-3.5 text-orange-500" />
+                                )}
+                                <span className="text-xs font-semibold">Your Selected Dates</span>
+                                <Badge variant="outline" className={`text-[10px] ml-auto ${
+                                  sustainability.travelDateAssessment.currentDates?.suitability === 'Suitable' ? 'border-emerald-400 text-emerald-600' :
+                                  sustainability.travelDateAssessment.currentDates?.suitability === 'Not Ideal' ? 'border-orange-400 text-orange-600' :
+                                  'border-amber-400 text-amber-600'
+                                }`}>
+                                  {sustainability.travelDateAssessment.currentDates?.suitability || 'Moderate'}
+                                </Badge>
+                              </div>
+                              <p className="text-xs text-muted-foreground">
+                                {sustainability.travelDateAssessment.currentDates?.reason || 'Standard tourist period'}
+                              </p>
+                            </div>
+
+                            <div className="p-2.5 rounded-lg border bg-emerald-50/50 border-emerald-200 dark:bg-emerald-950/20 dark:border-emerald-800">
+                              <div className="flex items-center gap-2 mb-1">
+                                <CalendarCheck className="h-3.5 w-3.5 text-emerald-500" />
+                                <span className="text-xs font-semibold">Recommended Period</span>
+                                <Badge variant="outline" className="text-[10px] ml-auto border-emerald-400 text-emerald-600">
+                                  Better
+                                </Badge>
+                              </div>
+                              <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400 mb-0.5">
+                                {sustainability.travelDateAssessment.recommendedDates?.period || 'Off-peak season'}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                {sustainability.travelDateAssessment.recommendedDates?.reason || 'Lower crowds and reduced environmental impact'}
+                              </p>
+                            </div>
+                          </div>
+
+                          {sustainability.travelDateAssessment.peakSeasons && sustainability.travelDateAssessment.peakSeasons.length > 0 && (
+                            <div className="mt-2 p-2.5 rounded-lg bg-orange-50/50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800">
+                              <div className="flex items-center gap-2 mb-1">
+                                <AlertTriangle className="h-3 w-3 text-orange-500" />
+                                <span className="text-xs font-semibold text-orange-700 dark:text-orange-400">Peak Seasons to Avoid</span>
+                              </div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {sustainability.travelDateAssessment.peakSeasons.map((season: string, idx: number) => (
+                                  <Badge key={idx} variant="outline" className="text-[10px] border-orange-300 text-orange-600 bg-orange-100/50 dark:bg-orange-900/20">
+                                    {season}
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Eco-Friendly Recommendations */}
+                      {sustainability.recommendations && sustainability.recommendations.length > 0 && (
+                        <div className="pt-3 mt-3 border-t">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Lightbulb className="h-4 w-4 text-amber-500" />
+                            <span className="text-sm font-semibold">Eco-Friendly Recommendations</span>
+                          </div>
+                          <div className="grid sm:grid-cols-2 gap-2">
+                            {sustainability.recommendations.map((rec: { tip?: string; impact?: string; category?: string } | string, idx: number) => {
+                              const tip = typeof rec === 'string' ? rec : rec.tip
+                              const impact = typeof rec === 'string' ? 'Medium' : (rec.impact || 'Medium')
+                              const category = typeof rec === 'string' ? 'Activity' : (rec.category || 'Activity')
+
+                              const getCategoryIcon = () => {
+                                switch (category) {
+                                  case 'Transport': return <Car className="h-3 w-3 text-blue-500 mt-0.5 shrink-0" />
+                                  case 'Food': return <Utensils className="h-3 w-3 text-orange-500 mt-0.5 shrink-0" />
+                                  case 'Accommodation': return <BedDouble className="h-3 w-3 text-purple-500 mt-0.5 shrink-0" />
+                                  case 'Waste': return <Recycle className="h-3 w-3 text-emerald-500 mt-0.5 shrink-0" />
+                                  default: return <TreePine className="h-3 w-3 text-teal-500 mt-0.5 shrink-0" />
+                                }
+                              }
+
+                              return (
+                                <div key={idx} className="flex items-start gap-2 p-2 rounded-lg bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-100 dark:border-emerald-900/30">
+                                  {getCategoryIcon()}
+                                  <div className="flex-1 min-w-0">
+                                    <span className="text-xs text-muted-foreground leading-relaxed block">{tip}</span>
+                                    <div className="flex items-center gap-1.5 mt-1">
+                                      <Badge variant="outline" className={`text-[10px] px-1.5 py-0 ${
+                                        impact === 'High' ? 'border-emerald-400 text-emerald-600' :
+                                        impact === 'Low' ? 'border-gray-300 text-gray-500' :
+                                        'border-blue-400 text-blue-600'
+                                      }`}>
+                                        {impact} Impact
+                                      </Badge>
+                                      <span className="text-[10px] text-muted-foreground">{category}</span>
+                                    </div>
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+            ) : (streamingMode === 'full' || isSectionExiting('f-sustainability')) ? (
+              <div className={isSectionExiting('f-sustainability') ? 'animate-skeleton-exit' : undefined}>
+                <SustainabilitySkeleton />
+              </div>
+            ) : null}
+
+            {/* Predictions & Alerts */}
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-alerts') ? (
+                <div className="animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-3">
                     <Bell className="h-4 w-4 text-rose-500" />
                     <h3 className="text-sm font-semibold">Predictions & Alerts</h3>
@@ -2962,9 +4345,15 @@ export default function TravelSmartPage() {
                     )}
                   </div>
                 </div>
+            ) : (streamingMode === 'full' || isSectionExiting('f-alerts')) ? (
+              <div className={isSectionExiting('f-alerts') ? 'animate-skeleton-exit' : undefined}>
+                <AlertsSkeleton />
+              </div>
+            ) : null}
 
-                {/* Personalized Suggestions */}
-                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0.7s', animationFillMode: 'backwards' }}>
+            {/* Personalized Suggestions */}
+            {generatedPlan && !quickGenerateData && contentVisible.has('f-suggestions') ? (
+                <div className="rounded-xl border bg-gradient-to-br from-rose-50 to-transparent dark:from-rose-950/20 dark:to-transparent p-4 animate-fade-in-up" style={{ animationDelay: '0s', animationFillMode: 'backwards' }}>
                   <div className="flex items-center gap-2 mb-4">
                     <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
                       <Lightbulb className="h-4 w-4 text-rose-500" />
@@ -2992,60 +4381,12 @@ export default function TravelSmartPage() {
                     })}
                   </div>
                 </div>
-              </>
-            )}
+            ) : (streamingMode === 'full' || isSectionExiting('f-suggestions')) ? (
+              <div className={isSectionExiting('f-suggestions') ? 'animate-skeleton-exit' : undefined}>
+                <SuggestionsSkeleton delay="0.7s" />
+              </div>
+            ) : null}
 
-            {/* Action Buttons */}
-            <div className="pt-4 space-y-3 animate-fade-in-up" style={{ animationDelay: '0.8s', animationFillMode: 'backwards' }}>
-              <Button
-                className="w-full h-11 font-semibold bg-gradient-to-r from-rose-500 to-rose-600 hover:from-rose-600 hover:to-rose-700 shadow-lg shadow-rose-500/20"
-                onClick={() => setShowSaveDialog(true)}
-              >
-                <CheckCircle2 className="mr-2 h-4 w-4" />
-                Confirm & Save Plan
-              </Button>
-              <Button
-                variant="outline"
-                className="w-full h-11 font-semibold"
-                onClick={() => {
-                  setCurrentStep('details')
-                  setGeneratedPlan(null)
-                  setQuickGenerateData(null)
-                  setTripData({
-                    destination: '',
-                    dateRange: undefined,
-                    travelers: 1,
-                    travelerNames: [''],
-                    travelerGenders: ['']
-                  })
-                  setPreferences([{
-                    travelStyle: 'balanced',
-                    crowdTolerance: 'avoid-crowd',
-                    preferredSeasons: [],
-                    safetyOptions: {
-                      avoidLateNight: true,
-                      preferWellLit: true,
-                      verifiedTransport: true
-                    },
-                    budgetMin: '',
-                    budgetMax: '',
-                    notifications: {
-                      crowd: true,
-                      weather: true,
-                      price: true,
-                      safety: true
-                    }
-                  }])
-                  setCurrentTravelerIndex(0)
-                  setSelectedPlan('Balanced Plan')
-                  setSubmitAttempted(false)
-                  setTouchedFields(new Set())
-                }}
-              >
-                <Plus className="mr-2 h-4 w-4" />
-                Create New Plan
-              </Button>
-            </div>
 
             {/* Save Confirmation Dialog */}
             <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
@@ -3094,6 +4435,28 @@ export default function TravelSmartPage() {
           </div>
         )}
       </div>
+
+      {/* Scroll to Top Button with progress ring - shown on results step after scrolling */}
+      {currentStep === 'results' && scrollProgress > 0.05 && (
+        <button
+          onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+          className="fixed bottom-14 right-3 sm:bottom-16 sm:right-4 z-50 w-11 h-11 rounded-full bg-white hover:bg-rose-50 shadow-lg shadow-black/10 flex items-center justify-center transition-all duration-300 hover:scale-110 animate-in fade-in zoom-in-75"
+          aria-label="Scroll to top"
+        >
+          <svg className="absolute inset-0 w-11 h-11 -rotate-90" viewBox="0 0 44 44">
+            <circle cx="22" cy="22" r="20" fill="none" stroke="#fecdd3" strokeWidth="2.5" />
+            <circle
+              cx="22" cy="22" r="20" fill="none"
+              stroke="#f43f5e" strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeDasharray={2 * Math.PI * 20}
+              strokeDashoffset={2 * Math.PI * 20 * (1 - scrollProgress)}
+              className="transition-[stroke-dashoffset] duration-100"
+            />
+          </svg>
+          <ArrowUp className="h-4 w-4 text-rose-500 relative z-10" />
+        </button>
+      )}
 
       {/* Group 5 Label */}
       <GroupLabel group={5} />
